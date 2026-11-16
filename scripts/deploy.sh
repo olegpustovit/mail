@@ -11,7 +11,10 @@ if [[ -f .envrc ]]; then
   source .envrc
   set +a
 fi
-[[ -n "${ICLOUD_EMAIL:-}" && -n "${ICLOUD_PASSWORD:-}" ]]
+# The sync parity gate compares the mirror with a real iCloud mailbox. Skip it only explicitly,
+# for changes that do not touch mail synchronization (for example sign-in changes).
+skip_parity=${MAIL_DEPLOY_SKIP_PARITY:-0}
+[[ "$skip_parity" == 1 || ( -n "${ICLOUD_EMAIL:-}" && -n "${ICLOUD_PASSWORD:-}" ) ]]
 
 version=$(git rev-parse --short HEAD)
 cd web
@@ -68,10 +71,14 @@ curl -fsS https://mail.microapps.space/ >/dev/null
 curl -fsS https://mail.microapps.space/healthz/sync
 
 # Pass as soon as iCloud and the mirror agree; give the post-restart import up to ~3 min.
-for attempt in {1..18}; do
-  if python3 scripts/check-sync-parity.py; then break; fi
-  if [[ "$attempt" == 18 ]]; then exit 1; fi
-  sleep 10
-done
+if [[ "$skip_parity" == 1 ]]; then
+  echo 'Sync parity check skipped (MAIL_DEPLOY_SKIP_PARITY=1)'
+else
+  for attempt in {1..18}; do
+    if python3 scripts/check-sync-parity.py; then break; fi
+    if [[ "$attempt" == 18 ]]; then exit 1; fi
+    sleep 10
+  done
+fi
 trap - ERR
 echo "Deploy PASS: $version"
