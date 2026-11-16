@@ -2,10 +2,8 @@ package authhttp
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -42,79 +40,14 @@ func TestUnauthorizedAndOrigin(t *testing.T) {
 	}
 }
 
-func TestResendVerificationWithoutPassword(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
-	ctx := context.Background()
-	s, err := auth.New(ctx, auth.Config{BaseURL: "https://mail.example.com", MongoURI: uri, ResendAPIKey: "test", EmailFrom: "test@example.com", EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close(ctx)
-	email := "resend-" + strings.ToLower(auth.Random()) + "@olegpustovit.com"
-	original := auth.Random()
-	if err = s.Put(ctx, auth.Record{ID: auth.Hash(original), Kind: "verify", Email: email, Data: "existing-password-hash", Expires: time.Now().Add(time.Minute)}); err != nil {
-		t.Fatal(err)
-	}
-	defer s.Delete(ctx, original)
-	h := New(s)
-	sent := 0
-	fresh := ""
-	h.emailClient = &http.Client{Transport: emailRoundTripper(func(r *http.Request) (*http.Response, error) {
-		var payload struct {
-			HTML string `json:"html"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatal(err)
-		}
-		match := regexp.MustCompile(`token=([^"&<]+)`).FindStringSubmatch(payload.HTML)
-		if len(match) != 2 {
-			t.Fatal("missing verification token")
-		}
-		fresh = match[1]
-		sent++
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
-	})}
-	defer func() {
-		if fresh != "" {
-			_ = s.Delete(ctx, fresh)
-		}
-	}()
-	mux := http.NewServeMux()
-	h.Register(mux)
-	post := func(email string) *httptest.ResponseRecorder {
-		body, _ := json.Marshal(map[string]string{"email": email})
-		r := httptest.NewRequest("POST", "/auth/resend", strings.NewReader(string(body)))
-		r.Header.Set("Origin", "https://mail.example.com")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, r)
-		return w
-	}
-	if w := post(email); w.Code != 202 || sent != 1 {
-		t.Fatalf("resend: %d, emails=%d", w.Code, sent)
-	}
-	record, err := s.Get(ctx, fresh, "verify", false)
-	if err != nil || record.Data != "existing-password-hash" || time.Until(record.Expires) > 30*time.Minute+time.Second {
-		t.Fatal("resend changed credentials or expiry", err)
-	}
-	if w := post("missing-" + email); w.Code != 202 || sent != 1 {
-		t.Fatal("resend disclosed an unknown registration or sent unsolicited mail")
-	}
-}
-
 func TestAccountPersistencePrecedesSyncInvalidation(t *testing.T) {
 	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
 	if uri == "" {
 		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
 	}
 	ctx := context.Background()
-	s, err := auth.New(ctx, auth.Config{BaseURL: "https://mail.example.com", MongoURI: uri, ResendAPIKey: "test", EmailFrom: "test@example.com", EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close(ctx)
+	s := testService(t, uri)
+	var err error
 	owner := "link-order-" + strings.ToLower(auth.Random()) + "@olegpustovit.com"
 	session := auth.Random()
 	if err = s.Put(ctx, auth.Record{ID: auth.Hash(session), Kind: "session", Email: owner, Expires: time.Now().Add(time.Minute)}); err != nil {
@@ -165,11 +98,8 @@ func TestOAuthPKCEIntegration(t *testing.T) {
 		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
 	}
 	ctx := context.Background()
-	s, e := auth.New(ctx, auth.Config{BaseURL: "https://mail.example.com", MongoURI: uri, ResendAPIKey: "test", EmailFrom: "test@example.com", EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close(ctx)
+	s := testService(t, uri)
+	var e error
 	h := New(s)
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -300,102 +230,6 @@ func TestOAuthPKCEIntegration(t *testing.T) {
 		t.Fatal("revocation failed")
 	}
 }
-func TestNativeLoginAndResetIntegration(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
-	ctx := context.Background()
-	s, e := auth.New(ctx, auth.Config{BaseURL: "https://mail.example.com", MongoURI: uri, ResendAPIKey: "test", EmailFrom: "test@example.com", EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close(ctx)
-	h := New(s)
-	mux := http.NewServeMux()
-	h.Register(mux)
-	email := "native-" + strings.ToLower(auth.Random()) + "@olegpustovit.com"
-	password := "correct horse battery staple"
-	hash, e := auth.HashPassword(password)
-	if e != nil {
-		t.Fatal(e)
-	}
-	verify := auth.Random()
-	if e = s.Put(ctx, auth.Record{ID: auth.Hash(verify), Kind: "verify", Email: email, Data: hash, Expires: time.Now().Add(time.Minute)}); e != nil {
-		t.Fatal(e)
-	}
-	post := func(path, body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("POST", path, strings.NewReader(body))
-		r.Header.Set("Origin", "https://mail.example.com")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, r)
-		return w
-	}
-	loginBody, _ := json.Marshal(map[string]string{"email": email, "password": password, "next": "//evil.com"})
-	if w := post("/auth/login", string(loginBody)); w.Code != 401 {
-		t.Fatal("unverified user logged in")
-	}
-	rw := httptest.NewRecorder()
-	mux.ServeHTTP(rw, httptest.NewRequest("GET", "/auth/verify?token="+verify, nil))
-	if rw.Code != 303 || rw.Header().Get("Location") != "/?verified=1" || len(rw.Result().Cookies()) != 1 {
-		t.Fatal("verification failed", rw.Code)
-	}
-	cookie := rw.Result().Cookies()[0]
-	defer s.Delete(ctx, cookie.Value)
-	if w := post("/auth/login", string(loginBody)); w.Code != 200 || !strings.Contains(w.Body.String(), `"next":"/"`) {
-		t.Fatal("verified login failed", w.Code, w.Body.String())
-	} else {
-		for _, c := range w.Result().Cookies() {
-			defer s.Delete(ctx, c.Value)
-		}
-	}
-	reset := auth.Random()
-	if e = s.Put(ctx, auth.Record{ID: auth.Hash(reset), Kind: "reset", Email: email, Expires: time.Now().Add(time.Minute)}); e != nil {
-		t.Fatal(e)
-	}
-	resetBody, _ := json.Marshal(map[string]string{"token": reset, "password": "a brand new password value"})
-	if w := post("/auth/reset", string(resetBody)); w.Code != 204 {
-		t.Fatal("password reset failed", w.Body.String())
-	}
-	if w := post("/auth/reset", string(resetBody)); w.Code != 400 {
-		t.Fatal("reset replay accepted")
-	}
-	if w := post("/auth/login", string(loginBody)); w.Code != 401 {
-		t.Fatal("old password accepted")
-	}
-	me := httptest.NewRequest("GET", "/api/me", nil)
-	me.AddCookie(cookie)
-	rw = httptest.NewRecorder()
-	mux.ServeHTTP(rw, me)
-	if rw.Code != 401 {
-		t.Fatal("password reset retained session")
-	}
-}
-
-type emailRoundTripper func(*http.Request) (*http.Response, error)
-
-func (f emailRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-func TestEmailPayload(t *testing.T) {
-	h := New(&auth.Service{Config: auth.Config{ResendAPIKey: "test-secret", EmailFrom: "Mail <mail@example.com>"}})
-	h.emailClient = &http.Client{Transport: emailRoundTripper(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != "https://api.resend.com/emails" || r.Header.Get("Authorization") != "Bearer test-secret" {
-			t.Fatal("wrong email delivery target or credentials")
-		}
-		var body struct {
-			From          string
-			To            []string
-			Subject, HTML string
-		}
-		if json.NewDecoder(r.Body).Decode(&body) != nil || body.From != "Mail <mail@example.com>" || len(body.To) != 1 || body.To[0] != "ursus95@gmail.com" || !strings.Contains(body.HTML, "&amp;") {
-			t.Fatal("incorrect or unescaped email payload")
-		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"id":"email-id"}`)), Header: http.Header{}}, nil
-	})}
-	if e := h.sendEmail(context.Background(), "ursus95@gmail.com", "Verify", "Continue", "https://mail.example.com/verify?token=x&next=y"); e != nil {
-		t.Fatal(e)
-	}
-}
-
 func TestMetadataAliasAndCORS(t *testing.T) {
 	h := New(&auth.Service{Config: auth.Config{BaseURL: "https://mail.example.com"}})
 	mux := http.NewServeMux()

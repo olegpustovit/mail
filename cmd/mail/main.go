@@ -71,7 +71,11 @@ func run() error {
 			slog.Warn("resume connected mailbox", "owner", owner, "error", err)
 		}
 	}
-	handler, err := newHandler(service, syncService)
+	identity, err := auth.IdentityConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	handler, err := newHandler(service, syncService, &identity)
 	if err != nil {
 		return err
 	}
@@ -140,9 +144,17 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func newHandler(service *auth.Service, state *mailsync.Service) (http.Handler, error) {
+func newHandler(service *auth.Service, state *mailsync.Service, identity *auth.IdentityConfig) (http.Handler, error) {
 	mux := http.NewServeMux()
 	authHandler := authhttp.New(service)
+	if identity != nil {
+		startup, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := authHandler.EnableIdentity(startup, *identity)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("enable Microapps ID: %w", err)
+		}
+	}
 	if state != nil {
 		authHandler.ValidateAccount = state.ValidateAccount
 		state.ConfigurePush(service.ActiveSession, service.Config.BaseURL)

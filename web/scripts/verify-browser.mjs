@@ -42,7 +42,7 @@ const server=createServer(async(req,res)=>{
   let body='';for await(const chunk of req)body+=chunk
   const data=body?JSON.parse(body):null
   if(url.pathname==='/api/me')return json(signedIn?200:401,signedIn?account:{error:'login_required'})
-  if(url.pathname==='/auth/login'){if(data.password!=='test-password')return json(401,{error:'invalid_credentials'});signedIn=true;return json(200,{next:'/'})}
+  if(url.pathname==='/api/auth/id/login'){signedIn=true;res.writeHead(303,{Location:'/','Cache-Control':'no-store'});return res.end()}
   if(url.pathname==='/api/sessions')return json(200,[{agent:'Chrome Linux',current:true,expires:new Date(Date.now()+86400000).toISOString()}])
   if(url.pathname==='/api/mail/push'){if(req.method==='POST'){const device={id:'fixture-push',name:data.name,zone:data.zone};pushDevices.splice(0,pushDevices.length,device);return json(201,device)}return json(200,{publicKey:'B'+Buffer.alloc(64).toString('base64url'),devices:pushDevices})}
   if(url.pathname.startsWith('/api/mail/push/')&&req.method==='DELETE'){pushDevices.splice(0);return json(200,{})}
@@ -126,10 +126,9 @@ try{
  await page.evaluate(()=>document.fonts.ready)
  await mkdir('../.impeccable/review',{recursive:true})
  await page.screenshot({animations:'disabled',fullPage:true,path:'../.impeccable/review/auth-desktop.png'})
- await page.locator('[data-a="auth:register"]').click();await page.getByText('NEW_OPERATOR: ENROLL').waitFor()
- await page.locator('[data-a="auth:login"]').click()
- await page.getByLabel('Email',{exact:true}).fill(account.email);await page.getByLabel('Password',{exact:true}).fill('invalid-password');await page.locator('#auth-form button[type="submit"],#auth-form button:not([type])').click();await page.getByRole('alert').waitFor()
- await page.getByLabel('Password',{exact:true}).fill('test-password');await page.locator('#auth-form button:not([type])').click()
+ assert.equal(await page.locator('input[type="password"],input[type="email"]').count(),0,'sign-in must not offer local credentials')
+ await page.getByText('CONTINUE WITH MICROAPPS ID').waitFor()
+ await page.locator('#id-login').click()
  await waitForBootstrapAttempts(5)
  assert.deepEqual(await page.evaluate(()=>new Promise((resolve,reject)=>{const request=indexedDB.open('terminal-mail:browser-test@olegpustovit.com:browser-test@icloud.com');request.onerror=()=>reject(request.error);request.onsuccess=()=>{const db=request.result,tx=db.transaction(['meta','folders'],'readonly'),meta=tx.objectStore('meta').count(),folders=tx.objectStore('folders').count();tx.oncomplete=()=>{db.close();resolve({meta:meta.result,folders:folders.result})};tx.onerror=()=>reject(tx.error)}})),{meta:0,folders:0})
  await page.locator('.row').first().waitFor();await page.getByText('Please review the launch notes.',{exact:false}).waitFor()

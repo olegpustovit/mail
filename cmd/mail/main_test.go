@@ -109,7 +109,7 @@ func (b bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestProductionRoutes(t *testing.T) {
-	handler, err := newHandler(&auth.Service{Config: auth.Config{BaseURL: "https://mail.microapps.space"}}, nil)
+	handler, err := newHandler(&auth.Service{Config: auth.Config{BaseURL: "https://mail.microapps.space"}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

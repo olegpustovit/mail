@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	idclient "github.com/olegpustovit/identity/idclient-go"
+
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
 )
 
@@ -22,21 +24,21 @@ type Handler struct {
 	InvalidateAccount func(context.Context, string, bool) error
 	ValidateAccount   func(context.Context, string, string, string) error
 	s                 *auth.Service
-	emailClient       *http.Client
+	id                *idclient.Client
 	mu                sync.Mutex
 	requests          int
-	emailRequests     int
 	window            time.Time
 }
 
-func New(s *auth.Service) *Handler { return &Handler{s: s, emailClient: http.DefaultClient} }
+func New(s *auth.Service) *Handler { return &Handler{s: s} }
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /auth/login", h.limited(h.login))
-	mux.HandleFunc("POST /auth/register", h.limited(h.signup))
-	mux.HandleFunc("POST /auth/resend", h.limited(h.resend))
-	mux.HandleFunc("GET /auth/verify", h.limited(h.verify))
-	mux.HandleFunc("POST /auth/forgot", h.limited(h.forgot))
-	mux.HandleFunc("POST /auth/reset", h.limited(h.reset))
+	// Microapps ID is the only sign-in. The retired local credential routes answer 403 so old clients get a clear message.
+	for _, route := range []string{"POST /auth/login", "POST /auth/register", "POST /auth/resend", "GET /auth/verify", "POST /auth/forgot", "POST /auth/reset"} {
+		mux.HandleFunc(route, identityRequired)
+	}
+	mux.HandleFunc("GET /api/auth/id/login", h.limited(h.identity((*idclient.Client).Login)))
+	mux.HandleFunc("GET /api/auth/id/callback", h.limited(h.identity((*idclient.Client).Callback)))
+	mux.HandleFunc("POST /api/auth/id/logout", h.identity((*idclient.Client).Logout))
 	mux.HandleFunc("POST /auth/logout", h.logout)
 	mux.HandleFunc("GET /api/me", h.me)
 	mux.HandleFunc("PUT /api/account", h.account)
@@ -87,7 +89,7 @@ func (h *Handler) cookie(w http.ResponseWriter, name, value string, age int) {
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: age})
 }
 func (h *Handler) Session(r *http.Request) (string, error) {
-	c, e := r.Cookie("__Host-mail_session")
+	c, e := r.Cookie(sessionCookie)
 	if e != nil {
 		return "", auth.ErrUnauthorized
 	}
@@ -105,13 +107,13 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "invalid_origin")
 		return
 	}
-	if c, e := r.Cookie("__Host-mail_session"); e == nil {
+	if c, e := r.Cookie(sessionCookie); e == nil {
 		if e = h.s.Delete(r.Context(), c.Value); e != nil {
 			fail(w, 500, "logout_failed")
 			return
 		}
 	}
-	h.cookie(w, "__Host-mail_session", "", -1)
+	h.cookie(w, sessionCookie, "", -1)
 	w.Header().Set("Clear-Site-Data", `"storage"`)
 	w.WriteHeader(204)
 }
@@ -274,7 +276,8 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	email, e := h.Session(r)
 	if e != nil {
-		http.Redirect(w, r, "/?login=1&next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+		// The target is the fixed local login path; the requested URL is only an escaped query value.
+		http.Redirect(w, r, loginURL(r.URL.RequestURI()), http.StatusSeeOther) //nolint:gosec
 		return
 	}
 	if r.Method == "GET" {
@@ -399,14 +402,9 @@ func (h *Handler) limited(next http.HandlerFunc) http.HandlerFunc {
 		if now.Sub(h.window) >= time.Minute {
 			h.window = now
 			h.requests = 0
-			h.emailRequests = 0
 		}
 		h.requests++
 		allowed := h.requests <= 120
-		if r.URL.Path == "/auth/register" || r.URL.Path == "/auth/forgot" || r.URL.Path == "/auth/resend" {
-			h.emailRequests++
-			allowed = allowed && h.emailRequests <= 10
-		}
 		h.mu.Unlock()
 		if !allowed {
 			w.Header().Set("Retry-After", "60")

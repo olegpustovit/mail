@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -26,7 +28,7 @@ func TestMongoCredentialIsolationAndTokens(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", MongoURI: uri, ResendAPIKey: "test", EmailFrom: "test@example.com", EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", MongoURI: uri, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -121,17 +123,71 @@ func TestMongoCredentialIsolationAndTokens(t *testing.T) {
 		t.Fatal("session revocation crossed owners")
 	}
 }
-func TestPasswordHash(t *testing.T) {
-	hash, e := HashPassword("correct horse battery staple")
+func TestLinkIdentity(t *testing.T) {
+	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
+	if uri == "" {
+		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	name := "mail_test_" + Random()
+	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", MongoURI: uri, Database: name, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if hash == "correct horse battery staple" || !CheckPassword(hash, "correct horse battery staple") || CheckPassword(hash, "wrong") {
-		t.Fatal("password verification failed")
+	defer s.Close(ctx)
+	defer func() { _ = s.db.Drop(ctx) }()
+	owner, e := s.LinkIdentity(ctx, "sub-1", " Person@OlegPustovit.com ")
+	if e != nil || owner != "person@olegpustovit.com" {
+		t.Fatal("first sign-in did not link the normalized email", owner, e)
 	}
-	for _, bad := range []string{"", "a.b", "..."} {
-		if CheckPassword(bad, "password") {
-			t.Fatal("invalid hash accepted")
+	// A known subject keeps its owner even when the verified email changes.
+	if owner, e = s.LinkIdentity(ctx, "sub-1", "ursus95@gmail.com"); e != nil || owner != "person@olegpustovit.com" {
+		t.Fatal("changed email moved a linked subject", owner, e)
+	}
+	// Another subject cannot take an owner that is already linked.
+	if _, e = s.LinkIdentity(ctx, "sub-2", "person@olegpustovit.com"); !errors.Is(e, ErrUnauthorized) {
+		t.Fatal("second subject linked an owned mailbox", e)
+	}
+	for _, email := range []string{"stranger@example.com", "", "evil@olegpustovit.com.evil.test"} {
+		if _, e = s.LinkIdentity(ctx, "sub-3", email); !errors.Is(e, ErrUnauthorized) {
+			t.Fatalf("%q was linked: %v", email, e)
 		}
+	}
+	if _, e = s.LinkIdentity(ctx, "", "person@olegpustovit.com"); !errors.Is(e, ErrUnauthorized) {
+		t.Fatal("empty subject accepted")
+	}
+	// Concurrent first sign-ins for one subject converge on one owner.
+	results := make(chan string, 8)
+	for range 8 {
+		go func() { o, _ := s.LinkIdentity(ctx, "sub-race", "race@olegpustovit.com"); results <- o }()
+	}
+	for range 8 {
+		if o := <-results; o != "race@olegpustovit.com" {
+			t.Fatal("concurrent link diverged", o)
+		}
+	}
+}
+
+func TestIdentityConfigFromEnv(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
+	set := func(id, cookie string) {
+		t.Setenv("MAIL_ID_CLIENT_ID", id)
+		t.Setenv("MAIL_ID_COOKIE_KEY", cookie)
+	}
+	set("", key)
+	if _, e := IdentityConfigFromEnv(); e == nil {
+		t.Fatal("missing client id accepted")
+	}
+	for _, bad := range []string{"", "not base64!", base64.StdEncoding.EncodeToString(make([]byte, 32)), base64.StdEncoding.EncodeToString(make([]byte, 16))} {
+		set("app_mail", bad)
+		if _, e := IdentityConfigFromEnv(); e == nil {
+			t.Fatalf("cookie key %q accepted", bad)
+		}
+	}
+	set("app_mail", key)
+	cfg, e := IdentityConfigFromEnv()
+	if e != nil || cfg.Issuer != "https://id.microapps.space" || cfg.CookieKey[0] != 9 {
+		t.Fatal("valid configuration rejected", e)
 	}
 }

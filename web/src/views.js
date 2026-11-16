@@ -17,21 +17,7 @@ function shell(title,lines,body,foot='',connect=false) {
   return `<main class="scr ${connect?'link-screen':''}">${deco}<a class="brand" href="/" aria-label="Terminal Mail home"><span class="sq"></span>TERMINAL_MAIL</a><div class="auth-layout"><div class="crop auth-hero"><h1 class="hl">${title}</h1><div class="prm big">${lines.map(l=>`<div>${l}</div>`).join('')}</div></div><div class="auth-window">${body}</div></div><div class="foot"><span>mail.microapps.space</span><span>${foot}</span></div></main>`
 }
 export function authView(s) {
-  const mode=s.mode
-  const content={
-    login:['SYSTEM_STATUS: LOCKED',['IDENTITY: REQUIRED //','MAILBOX: ENCRYPTED //','AGENTS: STANDING_BY'],'AUTH.SYS','SIGN_IN'],
-    register:['NEW_OPERATOR: ENROLL',['INVITE_ONLY_DOMAINS //','VERIFICATION: EMAIL //','PASSWORD: SCRYPT'],'REGISTER.SYS','CREATE_ACCOUNT'],
-    verify:['LINK_SENT: CHECK_INBOX',[`TO: ${esc(s.authEmail)} //`,'EXPIRES: 30 MIN //','SINGLE_USE: TRUE'],'VERIFY.SYS','RESEND_LINK'],
-    forgot:['CREDENTIAL_RESET',['IDENTITY: EMAIL //','LINK: SINGLE_USE //','EXPIRES: 30 MIN'],'RESET.SYS','SEND_RESET_LINK'],
-    reset:['CREDENTIAL_RESET',['ALL_SESSIONS: REVOKED //','MCP_TOKENS: REVOKED //','ICLOUD_LINK: KEPT'],'RESET.SYS','SET_PASSWORD'],
-  }[mode]
-  const [h,l,title,cta]=content
-  let fields=''
-  if(mode!=='reset'&&mode!=='verify')fields+=field('email','Email','email','you@olegpustovit.com',s.authEmail,'required autocomplete="email"')
-  if(['login','register','reset'].includes(mode))fields+=field('password',mode==='reset'?'New password':mode==='register'?'Password · 12+':'Password','password',mode==='login'?'Your password':'At least 12 characters',s.authPassword,`required maxlength="128" ${mode==='login'?'':'minlength="12"'} autocomplete="${mode==='login'?'current-password':'new-password'}"`)
-  if(mode==='verify')fields+=`<div class="dots" style="height:110px;border:var(--frame);display:grid;place-items:center;font-size:44px">${ico('mail')}</div>`
-  const alt=mode==='login'?button('auth:register','REGISTER','link')+button('auth:forgot','FORGOT','link'):button('auth:login',mode==='verify'?'DIFFERENT EMAIL':'BACK TO SIGN IN','link')
-  return shell(h,l,W(title,`<form id="auth-form" class="form-grid">${alert(s)}${fields}<button class="btn pri lg wide" style="justify-content:center" ${s.busy?'disabled':''}>${s.busy?'PLEASE_WAIT':cta} ${K('↵')}</button><div class="form-links">${alt}</div></form>`,{on:1,cls:'pop',a:'auth'}))
+  return shell('SYSTEM_STATUS: LOCKED',['IDENTITY: MICROAPPS_ID //','MAILBOX: ENCRYPTED //','AGENTS: STANDING_BY'],W('AUTH.SYS',`<div class="form-grid">${alert(s)}<p class="lbl" style="line-height:1.6">Sign in with your Microapps ID. Access is limited to approved accounts.</p><a id="id-login" class="btn pri lg wide" style="justify-content:center;text-decoration:none" href="/api/auth/id/login">CONTINUE WITH MICROAPPS ID</a></div>`,{on:1,cls:'pop',a:'auth'}),'SIGN_IN')
 }
 export function connectView(s) {
   const body=W('LINK_ICLOUD.SYS // STEP 2 OF 3',`<form id="link-form" class="form-grid">${alert(s)}${field('icloud-email','iCloud address','email','you@icloud.com',s.icloudEmail,'required autocomplete="email"')}${field('icloud-password','App-specific password','password','xxxx-xxxx-xxxx-xxxx','','required autocomplete="new-password"')}<button class="btn pri lg wide" style="justify-content:center" ${s.busy?'disabled':''}>${s.busy?'TESTING_CONNECTION':s.error?'RETRY':'TEST_AND_LINK'} ${K('↵')}</button>${s.account?.connected?button('mail','BACK TO MAIL','link'):button('logout','SIGN OUT','link')}</form>`,{on:1,cls:'pop',noctl:true})+`<div class="link-warning">${W('WARNING',`${TRI}<div class="warnlbl">${s.error?'LOGIN: REJECTED':'NEVER USE YOUR<br>APPLE ID PASSWORD'}<br><span style="font-weight:400;font-size:11px">${s.error?'USE AN APP-SPECIFIC ONE':'ENCRYPTED // REVOCABLE'}</span></div>`,{on:1,cls:'pop warnwin',noctl:true})}</div>`

@@ -42,7 +42,9 @@ test('untrusted message and account content cannot escape the UI',()=>{
   const html=mailView(s)
   assert.equal(html.includes('<script>bad()'),false);assert.equal(html.includes('<img src=x'),false)
   assert.match(html,/&lt;script&gt;/)
-  assert.match(authView({mode:'login',authEmail:'" autofocus onfocus="bad()',authPassword:''}),/&quot;/)
+  const login=authView({error:'" autofocus onfocus="bad()'})
+  assert.match(login,/&quot;/);assert.match(login,/href="\/api\/auth\/id\/login"/);assert.match(login,/MICROAPPS ID/)
+  assert.doesNotMatch(login,/type="password"|type="email"|REGISTER|FORGOT/)
 })
 test('email frame denies scripts, remote images, forms and base URLs',()=>{
   const html=emailDocument('<p>Hello</p>')

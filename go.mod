@@ -1,6 +1,6 @@
 module github.com/olegpustovit/mcp-icloud-email
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
@@ -12,8 +12,8 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/olegpustovit/identity/idclient-go v0.0.0-20261116080624-9c0a96699ea8
 	go.mongodb.org/mongo-driver/v2 v2.4.4
-	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.62.0
 )
 
@@ -21,7 +21,9 @@ replace github.com/emersion/go-imap/v2 => ./third_party/go-imap-v2
 
 require (
 	github.com/aymerick/douceur v0.2.0 // indirect
+	github.com/coreos/go-oidc/v3 v3.21.0 // indirect
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
@@ -33,7 +35,8 @@ require (
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
-	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/oauth2 v0.38.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect

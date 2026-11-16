@@ -4,7 +4,7 @@ Authority: artifact mx4gywdnv23g, version 3 (docs/design/web-client.html), with 
 
 ## Required surfaces and behavior
 
-- [x] A. Access: sign in, register, verify/resend, forgot/reset, link/rejected credentials, initial sync progress and enter-inbox.
+- [x] A. Access: Microapps ID sign-in (superseded the original email/password, verify and reset flows, 2026-11-16), link/rejected credentials, initial sync progress and enter-inbox.
 - [x] B. Mail: three panes, real folders/counts/quota, conversations/thread expansion, inline replies, newsletter unsubscribe and blocked remote content, unread/files/flagged filters, bulk select/drag, snoozed, drafts, empty inbox, collapse/maximize/spines, pending state.
 - [x] C. Overlays: command palette, operator search/chips/highlights, folder picker/create, snooze/custom date, seven flag colors, keymap, attachment preview/download, undo countdown.
 - [x] D. Compose: floating/full/minimized, recipients/autocomplete/CC/BCC, aliases/signatures, attachments/formatting, draft autosave to iCloud, undo-send and scheduled send surviving closed tabs.
@@ -137,3 +137,11 @@ Physical push-provider delivery and mutations of a real iCloud mailbox are not p
 - Full browser workflows pass on Chromium 149 and 156. Chromium 156 reports expected CSP blocks for the deliberately hostile rich-text fixture; those are allowed only during that probe, while unsafe markup/execution and all other CSP errors still fail the check. The final Chromium 156 50k fixture passed at 45.9 ms first view, 6.1 ms keyboard paint p95, 3.4 ms cached body, 25 mounted rows.
 - Live checks passed: health/static/CSP/fonts/PWA assets; temporary-account login/sessions/logout; unlinked-mailbox isolation; OAuth dynamic registration, consent, PKCE, refresh and family revocation; official SDK MCP initialization and discovery of 14 tools. Temporary records were removed. Evidence: `.impeccable/review/live-verification.txt`.
 - Production sign-in renders at 1440×900 and 390×844 without JavaScript/CSP errors; captures are saved as `live-auth-1440.png` and `live-auth-390.png`. Real iCloud sends/deletes and physical-device push delivery were not exercised.
+
+## Microapps ID only sign-in (2026-11-16)
+
+- Local email/password login, registration, verification, resend, forgot and reset code, the Resend delivery client and the scrypt password helpers were removed. `POST /auth/login|register|resend|forgot|reset` and `GET /auth/verify` now return 403 `identity_required` ("Sign in with Microapps ID.").
+- Sign-in uses the shared Go `idclient` (pinned to Identity commit `9c0a96699ea8`): `GET /api/auth/id/login`, `GET /api/auth/id/callback`, `POST /api/auth/id/logout`. `MAIL_ID_ISSUER`, `MAIL_ID_CLIENT_ID`, `MAIL_ID_CLIENT_SECRET`, `MAIL_ID_COOKIE_KEY` are required; startup fails without them.
+- A verified subject links to the mailbox owner by exact normalized email on first sign-in (collection `identities`, unique subject and email). Known subjects keep their owner when the Microapps ID email changes; another subject cannot take a linked owner; the existing `@olegpustovit.com` / `ursus95@gmail.com` allow-list still applies. Sessions keep the `__Host-mail_session` cookie and server-side records, so existing sessions survive the cutover.
+- OAuth `/oauth/authorize` redirects an unauthenticated browser to `/api/auth/id/login?return_to=...`; consent, PKCE, refresh and revocation are unchanged. The web sign-in screen is a single "Continue with Microapps ID" action.
+- Tests: link/race/deny cases against disposable `mail_test_*` databases (`auth.Config.Database`, tests drop them), a fake provider covering login, callback, session, origin-checked logout, unlisted and unverified email, subject takeover, and the authorize redirect.

@@ -44,7 +44,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.10'
+          go-version: '1.26.11'
+
+      - name: Allow the private Microapps ID module
+        env:
+          IDENTITY_READ_TOKEN: ${{ secrets.IDENTITY_READ_TOKEN }}
+        run: |
+          echo "GOPRIVATE=github.com/olegpustovit/identity" >> "$GITHUB_ENV"
+          git config --global url."https://x-access-token:${IDENTITY_READ_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Get dependencies
         run: go mod download

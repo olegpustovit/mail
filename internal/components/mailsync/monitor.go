@@ -190,7 +190,7 @@ func (s *Service) monitor(m *monitor) {
 func (s *Service) monitorConnected(m *monitor, wire syncTransport) error {
 	m.lastProgress.Store(time.Now().UnixNano())
 	stopWatchdog := watchProgress(m.ctx, &m.lastProgress, 15*time.Second, 3*time.Minute, time.Now, func() {
-		age := time.Now().Sub(time.Unix(0, m.lastProgress.Load()))
+		age := time.Since(time.Unix(0, m.lastProgress.Load()))
 		slog.Error("mail sync stalled", "owner", m.owner, "age", age)
 		ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
 		if status, err := s.Status(ctx, m.owner, m.account); err == nil {
@@ -395,21 +395,22 @@ func (s *Service) monitorConnected(m *monitor, wire syncTransport) error {
 				return err
 			}
 		case "event":
-			if event.Kind == "vanished" {
+			switch {
+			case event.Kind == "vanished":
 				slog.Info("mail sync VANISHED", "folder", event.Folder, "uids", event.UIDs.String(), "earlier", event.Earlier)
 				err = s.reconcileVanished(m, wire, event, requestActor(pendingRequest, event.Folder))
-			} else if event.Kind == "fetch" && event.Folder != "" {
+			case event.Kind == "fetch" && event.Folder != "":
 				uids, ok := event.Numbers()
 				if ok && len(uids) > 0 {
 					err = s.reconcileUIDs(m, wire, event.Folder, uids, requestActor(pendingRequest, event.Folder))
 				} else {
 					err = s.reconcileFolder(m, wire, event.Folder, false, requestActor(pendingRequest, event.Folder), "")
 				}
-			} else if event.Kind == "mailbox" && event.Folder != "" {
+			case event.Kind == "mailbox" && event.Folder != "":
 				err = s.reconcileMailboxEvent(m, wire, event.Folder, requestActor(pendingRequest, event.Folder))
-			} else if event.Folder == "" {
+			case event.Folder == "":
 				err = s.reconcileFolder(m, wire, "INBOX", false, requestActor(pendingRequest, "INBOX"), "")
-			} else {
+			default:
 				err = s.reconcileFolder(m, wire, event.Folder, false, requestActor(pendingRequest, event.Folder), "")
 			}
 			if err != nil {

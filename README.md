@@ -1,18 +1,18 @@
 # iCloud Mail MCP
 
-Terminal Mail is a multiuser iCloud web client and MCP server, with email/password login and MongoDB persistence. The web client includes conversations, offline triage, drafts, scheduled sends, snooze, rules, private image loading, and attributed agent activity. Fork of [roygabriel/mcp-icloud-email](https://github.com/roygabriel/mcp-icloud-email).
+Terminal Mail is a multiuser iCloud web client and MCP server, with Microapps ID sign-in and MongoDB persistence. The web client includes conversations, offline triage, drafts, scheduled sends, snooze, rules, private image loading, and attributed agent activity. Fork of [roygabriel/mcp-icloud-email](https://github.com/roygabriel/mcp-icloud-email).
 
 ## Hosted use
 
-Open https://mail.microapps.space, register, and verify your email. Registration is restricted to `*@olegpustovit.com` and `ursus95@gmail.com`. In settings, connect your iCloud address and an Apple **app-specific password** from https://account.apple.com. The server verifies the iCloud connection before saving it.
+Open https://mail.microapps.space and choose **Continue with Microapps ID**. Microapps ID is the only way to sign in: there are no local passwords, registration, verification emails or password resets. Access is restricted to Microapps ID accounts whose verified email is `*@olegpustovit.com` or `ursus95@gmail.com`. An existing mailbox is linked by that email on first sign-in; later sign-ins match the Microapps ID subject. In settings, connect your iCloud address and an Apple **app-specific password** from https://account.apple.com. The server verifies the iCloud connection before saving it.
 
-Add `https://mail.microapps.space/mcp` as a remote MCP server in your client and select OAuth authentication. Approve the client access request after signing in. Discovery, dynamic client registration, authorization code with PKCE, refresh tokens, and revocation are available. Client support depends on the client's remote MCP and OAuth capabilities; no iCloud password goes into client configuration.
+Add `https://mail.microapps.space/mcp` as a remote MCP server in your client and select OAuth authentication. Sign in with Microapps ID when the authorization page asks, then approve the client access request. Discovery, dynamic client registration, authorization code with PKCE, refresh tokens, and revocation are available. Client support depends on the client's remote MCP and OAuth capabilities; no iCloud password goes into client configuration.
 
-Each client grant permits reading, sending, and organizing your connected mailbox, including destructive operations. Only approve clients you trust. Disconnecting iCloud removes stored mailbox credentials; signing out ends the browser session. Use password reset to revoke all existing browser and client access tokens.
+Each client grant permits reading, sending, and organizing your connected mailbox, including destructive operations. Only approve clients you trust. Disconnecting iCloud removes stored mailbox credentials; signing out ends the browser session. Revoke other browsers or individual MCP clients from settings; a Microapps ID account change does not sign out existing mail sessions.
 
 ## Run the hosted server
 
-Requires Go 1.26.10+, Node 22.13+, MongoDB, and a Resend sending key with a verified sender domain.
+Requires Go 1.26.11+, Node 22.13+, MongoDB, and a Microapps ID app registration (see below). The Microapps ID Go client is a private module: set `GOPRIVATE=github.com/olegpustovit/identity` and authenticated Git access (for example `git config --global url."https://x-access-token:$TOKEN@github.com/".insteadOf https://github.com/`). CI uses the `IDENTITY_READ_TOKEN` secret; Docker builds take `--secret id=github_token,src=<file>`.
 
 ```sh
 cp .env.example .env
@@ -29,8 +29,14 @@ make server
 | `MAIL_ADDR` | Listen address; defaults to `127.0.0.1:4290` |
 | `MAIL_MONGODB_URI` | MongoDB URI; application database is `mail` |
 | `MAIL_ENCRYPTION_KEY` | Base64 encoding of 32 random bytes; generate once with `openssl rand -base64 32` |
-| `MAIL_RESEND_API_KEY` | Resend key for email verification and password reset |
-| `MAIL_EMAIL_FROM` | Verified sending address, optionally with a display name |
+| `MAIL_ID_ISSUER` | Microapps ID issuer; defaults to `https://id.microapps.space` |
+| `MAIL_ID_CLIENT_ID` | Client ID of the Mail app registered in Microapps ID (required) |
+| `MAIL_ID_CLIENT_SECRET` | Client secret for a confidential registration (omit for a public PKCE client) |
+| `MAIL_ID_COOKIE_KEY` | Base64 encoding of an independent random 32-byte key for the sign-in flow cookie; `openssl rand -base64 32`, persisted across restarts, never the encryption key (required) |
+
+The server refuses to start without a valid Microapps ID configuration, and performs provider discovery at startup. Register the app in Microapps ID with the exact redirect URI `https://mail.microapps.space/api/auth/id/callback`. Sign-in uses `GET /api/auth/id/login`, `GET /api/auth/id/callback` and `POST /api/auth/id/logout`; the retired local routes (`POST /auth/login`, `/auth/register`, `/auth/resend`, `/auth/forgot`, `/auth/reset`, `GET /auth/verify`) answer 403 `{"code":"identity_required","error":"Sign in with Microapps ID."}`. The session cookie is `__Host-mail_session`.
+
+The old `users` collection (password hashes) is no longer read; it stays in MongoDB only as rollback material. Linked Microapps ID subjects are stored in `identities` (unique subject and unique email).
 
 Keep the encryption key backed up separately with your database backup. Replacing or losing it makes stored iCloud credentials unreadable. Secrets belong in private service environment files, never in Git.
 
@@ -84,11 +90,12 @@ go test ./...
 go vet ./...
 # Include Mongo integration tests against a disposable test server:
 MAIL_TEST_MONGODB_URI=mongodb://127.0.0.1:27018 go test ./...
+# The auth service tests use disposable mail_test_* databases that they drop afterwards; never point the URI at production.
 ```
 
 The official MCP Go SDK owns protocol negotiation, Streamable HTTP and stdio framing, schema validation, and tool dispatch. Tool discovery does not connect to iCloud. Hosted tool calls share the owner's serialized command connection and mirror with the web client; the standalone stdio command closes its connection after the session.
 
-Passwords use salted scrypt hashes. iCloud credentials use AES-256-GCM authenticated encryption bound to the user. Browser sessions and MCP tokens are opaque, stored hashed, checked for expiration, and scoped to the requesting user. Browser writes require a matching Origin. MCP requests require bearer authentication and reject foreign origins. Email links are single-use and expire. Public authentication routes have bounded rate limits.
+Mail stores no login passwords. iCloud credentials use AES-256-GCM authenticated encryption bound to the user. Browser sessions and MCP tokens are opaque, stored hashed, checked for expiration, and scoped to the requesting user. Browser writes require a matching Origin. MCP requests require bearer authentication and reject foreign origins. Public authentication routes have bounded rate limits.
 
 ## Available Tools
 

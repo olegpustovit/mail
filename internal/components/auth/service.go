@@ -6,11 +6,9 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"golang.org/x/crypto/scrypt"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -25,7 +23,8 @@ import (
 
 var ErrUnauthorized = errors.New("unauthorized")
 
-type Config struct{ BaseURL, MongoURI, EncryptionKey, ResendAPIKey, EmailFrom string }
+// Database defaults to "mail"; only tests override it with a disposable name.
+type Config struct{ BaseURL, MongoURI, EncryptionKey, Database string }
 type Service struct {
 	Config Config
 	client *mongo.Client
@@ -76,8 +75,8 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if e != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("MAIL_BASE_URL must be an HTTPS origin")
 	}
-	if c.ResendAPIKey == "" || c.EmailFrom == "" || c.MongoURI == "" {
-		return nil, errors.New("missing MongoDB or email delivery configuration")
+	if c.MongoURI == "" {
+		return nil, errors.New("missing MongoDB configuration")
 	}
 	key, e := base64.StdEncoding.DecodeString(c.EncryptionKey)
 	if e != nil || len(key) != 32 {
@@ -99,8 +98,15 @@ func New(ctx context.Context, c Config) (*Service, error) {
 		_ = client.Disconnect(ctx)
 		return nil, fmt.Errorf("ping MongoDB: %w", e)
 	}
-	s := &Service{Config: c, client: client, db: client.Database("mail"), cipher: a}
+	database := c.Database
+	if database == "" {
+		database = "mail"
+	}
+	s := &Service{Config: c, client: client, db: client.Database(database), cipher: a}
 	_, e = s.db.Collection("auth").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)})
+	if e == nil {
+		_, e = s.db.Collection("identities").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)})
+	}
 	if e != nil {
 		_ = client.Disconnect(ctx)
 		return nil, e
@@ -109,14 +115,6 @@ func New(ctx context.Context, c Config) (*Service, error) {
 }
 func (s *Service) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
 
-func (s *Service) PendingVerification(ctx context.Context, email string) (Record, error) {
-	var record Record
-	err := s.db.Collection("auth").FindOne(ctx, bson.M{"kind": "verify", "email": email, "expires": bson.M{"$gt": time.Now()}}, options.FindOne().SetSort(bson.D{{Key: "expires", Value: -1}})).Decode(&record)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return record, ErrUnauthorized
-	}
-	return record, err
-}
 func (s *Service) Put(ctx context.Context, r Record) error {
 	if r.Created.IsZero() {
 		r.Created = time.Now().UTC()
@@ -208,7 +206,7 @@ func (s *Service) ConnectedOwners(ctx context.Context) ([]string, error) {
 }
 
 func ConfigFromEnv() Config {
-	return Config{BaseURL: strings.TrimRight(os.Getenv("MAIL_BASE_URL"), "/"), MongoURI: os.Getenv("MAIL_MONGODB_URI"), EncryptionKey: os.Getenv("MAIL_ENCRYPTION_KEY"), ResendAPIKey: os.Getenv("MAIL_RESEND_API_KEY"), EmailFrom: os.Getenv("MAIL_EMAIL_FROM")}
+	return Config{BaseURL: strings.TrimRight(os.Getenv("MAIL_BASE_URL"), "/"), MongoURI: os.Getenv("MAIL_MONGODB_URI"), EncryptionKey: os.Getenv("MAIL_ENCRYPTION_KEY")}
 }
 func (s *Service) Authenticate(r *http.Request) (string, error) {
 	email, _, err := s.AuthenticateClient(r)
@@ -236,67 +234,70 @@ func (s *Service) AuthenticateClient(r *http.Request) (string, string, error) {
 	return rec.Email, "mcp:" + rec.ClientID, nil
 }
 
-type User struct {
-	Email    string `bson:"_id"`
-	Password string `bson:"password" json:"-"`
+// Identity links one Microapps ID subject to the mailbox owner email.
+type Identity struct {
+	Subject string    `bson:"_id"`
+	Email   string    `bson:"email"`
+	Created time.Time `bson:"created"`
 }
 
-var passwordWorkers = make(chan struct{}, 4)
-
-func HashPassword(password string) (string, error) {
-	passwordWorkers <- struct{}{}
-	defer func() { <-passwordWorkers }()
-	salt := make([]byte, 16)
-	if _, e := rand.Read(salt); e != nil {
-		return "", e
+// LinkIdentity maps a verified Microapps ID subject to a mailbox owner and returns that owner's email.
+// A known subject keeps its original owner even if the Microapps ID email later changes, so an email
+// change can never move a subject onto another owner's mailbox. A new subject links by exact
+// normalized email to the existing owner data, and an email already linked to another subject is denied.
+func (s *Service) LinkIdentity(ctx context.Context, subject, email string) (string, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if subject == "" || len(subject) > 256 || !Allowed(email) {
+		return "", ErrUnauthorized
 	}
-	key, e := scrypt.Key([]byte(password), salt, 32768, 8, 1, 32)
-	if e != nil {
-		return "", e
+	coll := s.db.Collection("identities")
+	find := func() (string, error) {
+		var linked Identity
+		e := coll.FindOne(ctx, bson.M{"_id": subject}).Decode(&linked)
+		if errors.Is(e, mongo.ErrNoDocuments) {
+			return "", ErrUnauthorized
+		}
+		if e != nil {
+			return "", e
+		}
+		if !Allowed(linked.Email) {
+			return "", ErrUnauthorized
+		}
+		return linked.Email, nil
 	}
-	return base64.RawStdEncoding.EncodeToString(salt) + "." + base64.RawStdEncoding.EncodeToString(key), nil
-}
-func CheckPassword(hash, password string) bool {
-	passwordWorkers <- struct{}{}
-	defer func() { <-passwordWorkers }()
-	parts := strings.Split(hash, ".")
-	if len(parts) != 2 {
-		return false
+	if owner, e := find(); e == nil || !errors.Is(e, ErrUnauthorized) {
+		return owner, e
 	}
-	salt, e := base64.RawStdEncoding.DecodeString(parts[0])
-	if e != nil || len(salt) != 16 {
-		return false
-	}
-	want, e := base64.RawStdEncoding.DecodeString(parts[1])
-	if e != nil || len(want) != 32 {
-		return false
-	}
-	key, e := scrypt.Key([]byte(password), salt, 32768, 8, 1, 32)
-	return e == nil && subtle.ConstantTimeCompare(key, want) == 1
-}
-func (s *Service) User(ctx context.Context, email string) (User, error) {
-	var u User
-	e := s.db.Collection("users").FindOne(ctx, bson.M{"_id": email}).Decode(&u)
-	if errors.Is(e, mongo.ErrNoDocuments) {
-		return u, ErrUnauthorized
-	}
-	return u, e
-}
-func (s *Service) CreateUser(ctx context.Context, email, passwordHash string) error {
-	_, e := s.db.Collection("users").InsertOne(ctx, User{email, passwordHash})
+	_, e := coll.InsertOne(ctx, Identity{Subject: subject, Email: email, Created: time.Now().UTC()})
 	if mongo.IsDuplicateKeyError(e) {
-		return ErrUnauthorized
+		// A concurrent first sign-in for the same subject converges; any other duplicate is a different subject owning this email.
+		return find()
 	}
-	return e
-}
-func (s *Service) ResetPassword(ctx context.Context, email, passwordHash string) error {
-	result, e := s.db.Collection("users").UpdateOne(ctx, bson.M{"_id": email}, bson.M{"$set": bson.M{"password": passwordHash}})
 	if e != nil {
-		return e
+		return "", e
 	}
-	if result.MatchedCount != 1 {
-		return ErrUnauthorized
+	return email, nil
+}
+
+// IdentityConfig configures the Microapps ID client. All of it is required: it is the only sign-in method.
+type IdentityConfig struct {
+	Issuer, ClientID, ClientSecret string
+	CookieKey                      [32]byte
+}
+
+func IdentityConfigFromEnv() (IdentityConfig, error) {
+	issuer := strings.TrimRight(os.Getenv("MAIL_ID_ISSUER"), "/")
+	if issuer == "" {
+		issuer = "https://id.microapps.space"
 	}
-	_, e = s.db.Collection("auth").DeleteMany(ctx, bson.M{"email": email})
-	return e
+	cfg := IdentityConfig{Issuer: issuer, ClientID: os.Getenv("MAIL_ID_CLIENT_ID"), ClientSecret: os.Getenv("MAIL_ID_CLIENT_SECRET")}
+	if cfg.ClientID == "" {
+		return cfg, errors.New("MAIL_ID_CLIENT_ID is required")
+	}
+	key, e := base64.StdEncoding.DecodeString(os.Getenv("MAIL_ID_COOKIE_KEY"))
+	if e != nil || len(key) != 32 || [32]byte(key) == [32]byte{} {
+		return cfg, errors.New("MAIL_ID_COOKIE_KEY must be a base64-encoded independent random 32-byte key")
+	}
+	copy(cfg.CookieKey[:], key)
+	return cfg, nil
 }

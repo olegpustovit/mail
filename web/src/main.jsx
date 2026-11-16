@@ -18,7 +18,7 @@ import {sizeEmailFrame} from './email-frame.js'
 const root=document.getElementById('root')
 root.addEventListener('load',event=>{if(event.target.matches?.('.email-frame'))sizeEmailFrame(event.target)},true)
 const params=new URLSearchParams(location.search)
-const s={account:null,mode:params.has('reset_token')?'reset':'login',authEmail:'',authPassword:'',icloudEmail:'',busy:false,error:'',notice:params.get('verified')==='1'?'Email verified. Sign in to continue.':params.get('error')==='verification'?'That verification link is invalid or expired. Register again for a fresh link.':'',view:'mail',tab:'account',folder:'inbox',folders:[],msgs:[],total:0,counts:{},prefs:{},bodies:{},cur:0,picked:[],filter:'all',search:'',q:'',focus:'list',overlay:null,pal:'',palI:0,pickI:0,pickQuery:'',chord:null,compose:null,draft:null,draftStatus:'',loading:false,sending:false,bodyError:'',pending:0,offline:!navigator.onLine,...loadWins(),desktop:matchMedia('(min-width:761px)').matches,mobilePane:'list',signal:localStorage.getItem('mail.signal')==='true',theme:localStorage.getItem('mail.theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}
+const s={account:null,icloudEmail:'',busy:false,error:'',notice:'',view:'mail',tab:'account',folder:'inbox',folders:[],msgs:[],total:0,counts:{},prefs:{},bodies:{},cur:0,picked:[],filter:'all',search:'',q:'',focus:'list',overlay:null,pal:'',palI:0,pickI:0,pickQuery:'',chord:null,compose:null,draft:null,draftStatus:'',loading:false,sending:false,bodyError:'',pending:0,offline:!navigator.onLine,...loadWins(),desktop:matchMedia('(min-width:761px)').matches,mobilePane:'list',signal:localStorage.getItem('mail.signal')==='true',theme:localStorage.getItem('mail.theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}
 let replica=null,replicaAccount=''
 let folderGeneration=0, toastTimer, countdownTimer, chordTimer, draftTimer,searchTimer
 let undoStack=[]
@@ -93,10 +93,10 @@ function queuedSend(job){
  draw()
 }
 function errorText(err) {
-  return ({invalid_credentials:'Email or password is incorrect.',email_not_allowed:'Access is limited to @olegpustovit.com and ursus95@gmail.com.',password_must_be_12_to_128_characters:'Choose a password between 12 and 128 characters.',invalid_or_expired_reset_token:'This reset link is invalid or expired. Request a fresh link.',icloud_login_failed_check_app_specific_password:'iCloud rejected the login. Use an app-specific password from account.apple.com.',mailbox_unavailable_check_connection:'Could not open your mailbox. Check your iCloud connection or try again.',mail_operation_failed_try_refreshing:'The mail operation failed. Refresh to check its status before retrying.',email_unavailable:'Email delivery is unavailable. Please try again.'})[err.message]||err.message
+  return ({identity_required:'Sign in with Microapps ID.',icloud_login_failed_check_app_specific_password:'iCloud rejected the login. Use an app-specific password from account.apple.com.',mailbox_unavailable_check_connection:'Could not open your mailbox. Check your iCloud connection or try again.',mail_operation_failed_try_refreshing:'The mail operation failed. Refresh to check its status before retrying.'})[err.message]||err.message
 }
 async function start() {
-  s.error='';if(params.has('reset_token')){s.account=false;draw();return}draw()
+  s.error='';draw()
   try {s.account=await request('/api/me');setOwner(s.account.email,s.account.icloud_email);s.icloudEmail=s.account.icloud_email||'';if(s.account.connected){await initReplica();localStorage.setItem('mail.lastAccount',JSON.stringify(s.account));await Promise.all([loadFolders(),loadPreferences(),loadOutbox(),loadNotifications(true),loadOperations()])}draw()}
   catch(err){if(err.status===401){s.account=false;localStorage.removeItem('mail.lastAccount');replica?.close();replica=null}else if(localStorage.getItem('mail.lastAccount')){s.account=JSON.parse(localStorage.getItem('mail.lastAccount'));setOwner(s.account.email,s.account.icloud_email);s.offline=true;await initReplica();s.folders=await replica.call('get',{store:'settings',key:'folders'})||[];await loadFolder(s.folder)}else s.error=errorText(err);draw()}
 }
@@ -265,29 +265,6 @@ async function markOpenedRead(){
  const m=current(s)
  if((s.desktop||s.mobilePane==='reader')&&!s.picked.length&&m?.un&&m.f!=='drafts')await mutate('read',{read:true})
 }
-async function submitAuth(form) {
-  const data=new FormData(form)
-  if(data.has('email'))s.authEmail=data.get('email').trim()
-  if(data.has('password'))s.authPassword=data.get('password')
-  s.busy=true;s.error='';s.notice='';draw()
-  try{
-    const next=params.get('next')||undefined
-    if(s.mode==='login'){
-      const result=await request('/auth/login',{method:'POST',body:JSON.stringify({email:s.authEmail,password:s.authPassword,next})})
-      s.authPassword='';location.assign(result.next||'/');return
-    }
-    if(s.mode==='verify'){
-      const result=await request('/auth/resend',{method:'POST',body:JSON.stringify({email:s.authEmail,next})});s.notice=result.message
-    }else if(s.mode==='register'){
-      await request('/auth/register',{method:'POST',body:JSON.stringify({email:s.authEmail,password:s.authPassword,next})})
-      s.mode='verify';s.authPassword='';s.notice='Verification link sent. Check your inbox.'
-    }else if(s.mode==='forgot'){
-      const result=await request('/auth/forgot',{method:'POST',body:JSON.stringify({email:s.authEmail})});s.mode='login';s.notice=result.message
-    }else{
-      await request('/auth/reset',{method:'POST',body:JSON.stringify({token:params.get('reset_token'),password:s.authPassword})});s.mode='login';s.authPassword='';s.notice='Password updated. Sign in with your new password.'
-    }
-  }catch(err){s.error=errorText(err)}finally{s.busy=false;draw()}
-}
 async function linkAccount(form) {
   const data=new FormData(form);s.icloudEmail=data.get('icloud-email').trim();s.busy=true;s.error='';draw()
   try{await request('/api/account',{method:'PUT',body:JSON.stringify({email:s.icloudEmail,password:data.get('icloud-password')})});s.account=await request('/api/me');setOwner(s.account.email,s.account.icloud_email);s.view='mail';await initReplica();localStorage.setItem('mail.lastAccount',JSON.stringify(s.account));await Promise.all([loadFolders(),loadPreferences(),loadOutbox(),loadNotifications(true),loadOperations()])}
@@ -391,7 +368,6 @@ async function act(action){
   if(action.startsWith('revoke-client:')){if(!window.confirm('Revoke this MCP client’s access?'))return;try{await request('/api/clients/'+encodeURIComponent(action.slice(14)),{method:'DELETE'});await loadSettings('agents');say('CLIENT ACCESS REVOKED')}catch(err){say(errorText(err),true)}return}
   if(action.startsWith('undo-activity:')){try{await request('/api/mail/activity/'+action.slice(14)+'/undo',{method:'POST',body:'{}'});await loadSettings('agents');say('AGENT CHANGE UNDONE')}catch(err){say(errorText(err),true)}return}
   if(action.startsWith('edit-key:')){s.keyEdit=action.slice(9);draw();return}
-  if(action.startsWith('auth:')){s.mode=action.slice(5);s.error='';s.notice='';s.authPassword='';draw();return}
   if(action.startsWith('cancel-send:')){try{const draft=await request('/api/mail/outbox/'+encodeURIComponent(action.slice(12)),{method:'DELETE',body:'{}'});await restoreDraft(draft);s.compose='float';s.overlay=null;await loadOutbox();say('SEND CANCELLED // DRAFT RESTORED')}catch(err){say(errorText(err),true)}return}
   if(action.startsWith('toggle-original:')){const key=action.slice(16),on=s.originals?.includes(key);s.originals=on?s.originals.filter(id=>id!==key):[...(s.originals||[]),key];draw();if(!on&&s.prefs.remoteContent!=='original'&&s.bodies[key]?.remoteImages?.length&&!s.bodies[key].remoteAttempted)loadRemote(key);return}
   if(action.startsWith('manage-folder:')){s.managedFolder=s.renameFolder=action.slice(14);s.overlay='folder-settings';draw();return}
@@ -485,7 +461,7 @@ async function act(action){
     case'manage-senders':s.allowedSendersText=(s.prefs.allowedSenders||[]).join('\n');s.overlay='allowed-senders';break
     case'unsubscribe':s.unsubscribe={header:m.unsubscribe,from:m.who};s.overlay='unsubscribe';break
     case'unlink':if(!window.confirm('Unlink iCloud? Your mail on iCloud stays untouched.'))return;try{await request('/api/account',{method:'DELETE'});s.msgs=[];bodyRevision++;bodyRequests.clear();s.bodies={};await replica?.call('clear');replica?.close();replica=null;localStorage.removeItem('mail.lastAccount');s.account.connected=false;s.account.icloud_email='';draw()}catch(err){say(errorText(err),true)}return
-    case'logout':if((s.pending||s.draft)&&!window.confirm('Sign out and clear local drafts and pending changes from this device? Saved iCloud drafts stay in your mailbox.'))return;try{await request('/auth/logout',{method:'POST'});s.authPassword='';navigator.clearAppBadge?.()?.catch(()=>{});bodyRevision++;bodyRequests.clear();s.bodies={};await replica?.call('clear');replica?.close();localStorage.removeItem('mail.lastAccount');location.assign('/')}catch(err){say(errorText(err),true)}return
+    case'logout':if((s.pending||s.draft)&&!window.confirm('Sign out and clear local drafts and pending changes from this device? Saved iCloud drafts stay in your mailbox.'))return;try{await request('/auth/logout',{method:'POST'});navigator.clearAppBadge?.()?.catch(()=>{});bodyRevision++;bodyRequests.clear();s.bodies={};await replica?.call('clear');replica?.close();localStorage.removeItem('mail.lastAccount');location.assign('/')}catch(err){say(errorText(err),true)}return
   }
   draw()
 }
@@ -494,7 +470,6 @@ root.addEventListener('submit',async e=>{
   if(e.target.id==='rule-form'){await saveRule();return}
   if(e.target.id==='quiet-hours-form'){const patch={quietStart:s.quietStart,quietEnd:s.quietEnd};try{await request('/api/mail/preferences',{method:'PATCH',body:JSON.stringify(patch)});Object.assign(s.prefs,patch);s.overlay=null;draw()}catch(err){say(errorText(err),true)}return}
   if(e.target.id==='allowed-senders-form'){const senders=new FormData(e.target).get('senders').split(/[\n,;]/).map(value=>value.trim().toLowerCase()).filter(Boolean);if(await savePreference('allowedSenders',[...new Set(senders)])){s.overlay=null;draw()}return}
-  if(e.target.id==='auth-form')await submitAuth(e.target)
   if(e.target.id==='link-form')await linkAccount(e.target)
   if(e.target.id==='compose-form')await sendDraft()
   if(e.target.id==='schedule-form'){const time=new Date(new FormData(e.target).get('send-at'));if(!Number.isFinite(+time)||time<=new Date()){say('Choose a future send time.',true);return}s.sendAt=time.toISOString();s.overlay=null;await sendDraft()}
@@ -518,8 +493,6 @@ root.addEventListener('submit',async e=>{
 })
 root.addEventListener('input',e=>{
   const el=e.target
-  if(el.name==='email')s.authEmail=el.value
-  if(el.name==='password')s.authPassword=el.value
   if(el.id==='sq'){searchMail(el.value)}
   if(el.id==='pq'){s.pal=el.value;s.palI=0;draw()}
   if(el.id==='pick-query'){s.pickQuery=el.value;s.pickI=0;draw()}
@@ -566,7 +539,7 @@ root.addEventListener('click',e=>{
   if(row){s.cur=Number(row.dataset.i);s.bodyError='';if(e.target.closest('.mk')){act('select');return}}
   const thread=e.target.closest('[data-thread-message]');if(thread){const raw=current(s)?.threadMessages?.find(m=>m.key===thread.dataset.threadMessage);if(raw){s.openMessages=s.openMessages||[];s.openMessages=s.openMessages.includes(raw.key)?s.openMessages.filter(key=>key!==raw.key):[...s.openMessages,raw.key];draw();loadBody(false,message(raw,raw.folder))}return}
   const ctl=e.target.closest('[data-ctl-a]')
-  if(ctl){const [op,w]=ctl.dataset.ctlA.split('-');if(w==='auth'){if(op==='max'){s.authMax=!s.authMax;s.authMin=false}else{s.authMin=true;if(op==='close')s.authPassword=''}draw();return}if(w==='compose'){act(op==='max'?'full-compose':op==='close'?'discard-draft':'min-compose');return}if(WINS.includes(w)){if(s.desktop&&s.view==='mail')setWin(w,{min:'docked',max:'max',close:'collapse'}[op]);else if(w==='reader'){if(op==='close')s.cur=-1;else if(op==='min')s.mobilePane='list'}}if(w==='settings')s.view='mail';if(w==='preview'){s.overlay=null}draw();return}
+  if(ctl){const [op,w]=ctl.dataset.ctlA.split('-');if(w==='auth'){if(op==='max'){s.authMax=!s.authMax;s.authMin=false}else{s.authMin=true}draw();return}if(w==='compose'){act(op==='max'?'full-compose':op==='close'?'discard-draft':'min-compose');return}if(WINS.includes(w)){if(s.desktop&&s.view==='mail')setWin(w,{min:'docked',max:'max',close:'collapse'}[op]);else if(w==='reader'){if(op==='close')s.cur=-1;else if(op==='min')s.mobilePane='list'}}if(w==='settings')s.view='mail';if(w==='preview'){s.overlay=null}draw();return}
   const a=e.target.closest('[data-a]');if(a){act(a.dataset.a).catch(err=>say(errorText(err),true));return}
   const desk=e.target.closest('[data-desk]');if(desk){if(e.detail!==1){if(desk.dataset.desk==='go:inbox')setWin('list','tiled');act(desk.dataset.desk).catch(err=>say(errorText(err),true))}return}
   const folder=e.target.closest('[data-f]');if(folder){act('go:'+folder.dataset.f);return}

@@ -33,7 +33,7 @@ func (h *Handler) sessions(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "login_required")
 		return
 	}
-	cookie, _ := r.Cookie("__Host-mail_session")
+	cookie, _ := r.Cookie(sessionCookie)
 	if r.Method == http.MethodDelete {
 		if !h.origin(r) {
 			fail(w, 403, "invalid_origin")
