@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
 	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
 	"github.com/olegpustovit/mcp-icloud-email/tools"
 )
@@ -124,5 +126,47 @@ func TestProductionRoutes(t *testing.T) {
 		if w.Code != tc.status {
 			t.Errorf("%s status %d", tc.path, w.Code)
 		}
+	}
+}
+
+func TestProtectedWorkOwnsCancellationAndMapsAccessFailures(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+	}{{auth.ErrAccessDenied, 403}, {auth.ErrAccessUnavailable, 503}} {
+		guard := func(ctx context.Context, _ string) (context.Context, context.CancelFunc, error) {
+			next, cancel := context.WithCancel(ctx)
+			cancel()
+			return next, cancel, tc.err
+		}
+		h := protect(func(*http.Request) (string, error) { return "eval-owner", nil }, "https://mail.microapps.space", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("ineligible work ran") }), guard)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "https://mail.microapps.space/mcp", nil))
+		if w.Code != tc.status {
+			t.Fatal("access failure mapped incorrectly", w.Code)
+		}
+	}
+	ctx, revoke := context.WithCancel(t.Context())
+	defer revoke()
+	guard := mailsync.AccessGuard(func(context.Context, string) (context.Context, context.CancelFunc, error) {
+		return ctx, func() {}, nil
+	})
+	started, stopped := make(chan struct{}), make(chan struct{})
+	h := protect(func(*http.Request) (string, error) { return "eval-owner", nil }, "https://mail.microapps.space", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(stopped)
+	}), guard)
+	go h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "https://mail.microapps.space/mcp", nil))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("protected work did not start")
+	}
+	revoke()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP/MCP work ignored revocation")
 	}
 }

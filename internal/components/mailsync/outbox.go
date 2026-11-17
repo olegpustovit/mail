@@ -221,11 +221,24 @@ func (s *Service) CancelSend(ctx context.Context, owner, id string) error {
 }
 func (s *Service) deliverNext(ctx context.Context) error {
 	var job Outbox
-	err := s.db.Collection("mail_outbox").FindOneAndUpdate(ctx, bson.M{"status": "pending", "send_at": bson.M{"$lte": time.Now()}, "$or": []bson.M{{"retry_at": bson.M{"$exists": false}}, {"retry_at": bson.M{"$lte": time.Now()}}}}, bson.M{"$set": bson.M{"status": "sending"}}, options.FindOneAndUpdate().SetSort(bson.D{{Key: "send_at", Value: 1}})).Decode(&job)
+	filter := bson.M{"status": "pending", "send_at": bson.M{"$lte": time.Now()}, "$or": []bson.M{{"retry_at": bson.M{"$exists": false}}, {"retry_at": bson.M{"$lte": time.Now()}}}}
+	err := s.db.Collection("mail_outbox").FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "send_at", Value: 1}})).Decode(&job)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	work, release, allowed, err := s.jobWork(ctx, job.Owner, "mail_outbox", job.ID, "retry_at")
+	if err != nil || !allowed {
+		return err
+	}
+	defer release()
+	ctx = work
+	filter["_id"] = job.ID
+	if err = s.db.Collection("mail_outbox").FindOneAndUpdate(ctx, filter, bson.M{"$set": bson.M{"status": "sending"}}).Decode(&job); errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	} else if err != nil {
 		return err
 	}
 	status, problem := "sent", ""

@@ -19,6 +19,7 @@ import (
 	"github.com/olegpustovit/mcp-icloud-email/cmd/mail/mailhttp"
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
+	"github.com/olegpustovit/mcp-icloud-email/internal/httpcancel"
 	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
 	"github.com/olegpustovit/mcp-icloud-email/web"
 )
@@ -50,7 +51,14 @@ func run() error {
 		defer cancel()
 		_ = service.Close(closeCtx)
 	}()
-	syncService, err := mailsync.New(ctx, cfg.MongoURI, cfg.EncryptionKey, service.Credentials)
+	identity, err := auth.IdentityConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	if err = service.EnableAccess(identity); err != nil {
+		return err
+	}
+	syncService, err := mailsync.New(ctx, cfg.MongoURI, cfg.EncryptionKey, service.Credentials, service.WatchAccess)
 	if err != nil {
 		return err
 	}
@@ -70,10 +78,6 @@ func run() error {
 		if _, err := syncService.Start(ctx, owner); err != nil {
 			slog.Warn("resume connected mailbox", "owner", owner, "error", err)
 		}
-	}
-	identity, err := auth.IdentityConfigFromEnv()
-	if err != nil {
-		return err
 	}
 	handler, err := newHandler(service, syncService, &identity)
 	if err != nil {
@@ -96,7 +100,7 @@ func run() error {
 	}
 }
 
-func protect(authenticate func(*http.Request) (string, error), baseURL string, next http.Handler) http.Handler {
+func protect(authenticate func(*http.Request) (string, error), baseURL string, next http.Handler, guards ...mailsync.AccessGuard) http.Handler {
 	return protectPrincipal(func(r *http.Request) (string, string, error) {
 		email, err := authenticate(r)
 		actor := "web"
@@ -107,9 +111,9 @@ func protect(authenticate func(*http.Request) (string, error), baseURL string, n
 			actor = "prefetch:" + actor
 		}
 		return email, actor, err
-	}, baseURL, next)
+	}, baseURL, next, guards...)
 }
-func protectPrincipal(authenticate func(*http.Request) (string, string, error), baseURL string, next http.Handler) http.Handler {
+func protectPrincipal(authenticate func(*http.Request) (string, string, error), baseURL string, next http.Handler, guards ...mailsync.AccessGuard) http.Handler {
 	expected, _ := url.Parse(baseURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if expected == nil || r.Host != expected.Host {
@@ -122,9 +126,31 @@ func protectPrincipal(authenticate func(*http.Request) (string, string, error), 
 		}
 		email, actor, err := authenticate(r)
 		if err != nil {
+			if errors.Is(err, auth.ErrAccessDenied) {
+				http.Error(w, "Mail access denied", 403)
+				return
+			}
+			if errors.Is(err, auth.ErrAccessUnavailable) {
+				http.Error(w, "Mail access unavailable", 503)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource", scope="mail"`, baseURL))
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
+		}
+		if len(guards) > 0 {
+			ctx, cancel, err := guards[0](r.Context(), email)
+			if err != nil {
+				if errors.Is(err, auth.ErrAccessDenied) {
+					http.Error(w, "Mail access denied", 403)
+				} else {
+					http.Error(w, "Mail access unavailable", 503)
+				}
+				return
+			}
+			defer cancel()
+			defer httpcancel.Writes(ctx, w)()
+			r = r.WithContext(ctx)
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 20<<20)
 		ctx := context.WithValue(r.Context(), principalKey{}, email)
@@ -186,15 +212,15 @@ func newHandler(service *auth.Service, state *mailsync.Service, identity *auth.I
 		return mailmcp.Dependencies{}, errors.New("mail sync is unavailable")
 	}
 	server := mailmcp.New(resolve, version)
-	webAPI := protect(authHandler.Session, service.Config.BaseURL, mailhttp.New(resolve, service.Config.BaseURL, state, func(ctx context.Context) string { owner, _ := ctx.Value(principalKey{}).(string); return owner }, authHandler.Session))
+	webAPI := protect(authHandler.Session, service.Config.BaseURL, mailhttp.New(resolve, service.Config.BaseURL, state, func(ctx context.Context) string { owner, _ := ctx.Value(principalKey{}).(string); return owner }, authHandler.Session), service.WatchAccess)
 	mux.Handle("/api/mail/", webAPI)
 	mux.Handle("/api/sync/", webAPI)
 	// The reverse proxy preserves the public Host; protect enforces that exact host and origin.
 	transport := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, DisableLocalhostProtection: true, PropagateRequestCancellation: true, MaxRequestBodyBytes: 12 << 20})
-	mux.Handle("/mcp", protectPrincipal(service.AuthenticateClient, service.Config.BaseURL, transport))
+	mux.Handle("/mcp", protectPrincipal(service.AuthenticateClient, service.Config.BaseURL, transport, service.WatchAccess))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "version": version, "access_enforced": service.AccessEnabled()})
 	})
 	mux.HandleFunc("GET /healthz/sync", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

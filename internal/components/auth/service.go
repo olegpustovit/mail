@@ -30,8 +30,10 @@ type Service struct {
 	client *mongo.Client
 	db     *mongo.Database
 	cipher cipher.AEAD
+	access func(context.Context, string, bool) error
 }
 type Record struct {
+	Subject   string    `bson:"subject,omitempty" json:"-"`
 	ID        string    `bson:"_id"`
 	Kind      string    `bson:"kind"`
 	Email     string    `bson:"email,omitempty"`
@@ -176,6 +178,9 @@ func (s *Service) DeleteAccount(ctx context.Context, email string) error {
 	return e
 }
 func (s *Service) Credentials(ctx context.Context, email string) (string, string, error) {
+	if err := s.CheckOwner(ctx, email, false); err != nil {
+		return "", "", err
+	}
 	a, e := s.Account(ctx, email)
 	if e != nil {
 		return "", "", e
@@ -223,6 +228,9 @@ func (s *Service) AuthenticateClient(r *http.Request) (string, string, error) {
 	}
 	if !Allowed(rec.Email) || rec.Resource != s.Config.BaseURL+"/mcp" {
 		return "", "", ErrUnauthorized
+	}
+	if err := s.CheckRecord(r.Context(), rec, false); err != nil {
+		return "", "", err
 	}
 	result, err := s.db.Collection("auth").UpdateOne(r.Context(), bson.M{"_id": rec.ID, "kind": "access"}, bson.M{"$set": bson.M{"last_used": time.Now().UTC()}})
 	if err != nil {
@@ -281,6 +289,7 @@ func (s *Service) LinkIdentity(ctx context.Context, subject, email string) (stri
 
 // IdentityConfig configures the Microapps ID client. All of it is required: it is the only sign-in method.
 type IdentityConfig struct {
+	AccessEnabled                  bool
 	Issuer, ClientID, ClientSecret string
 	CookieKey                      [32]byte
 }
@@ -291,6 +300,16 @@ func IdentityConfigFromEnv() (IdentityConfig, error) {
 		issuer = "https://id.microapps.space"
 	}
 	cfg := IdentityConfig{Issuer: issuer, ClientID: os.Getenv("MAIL_ID_CLIENT_ID"), ClientSecret: os.Getenv("MAIL_ID_CLIENT_SECRET")}
+	switch os.Getenv("MAIL_ID_ACCESS_ENABLED") {
+	case "", "false":
+	case "true":
+		cfg.AccessEnabled = true
+	default:
+		return cfg, errors.New("MAIL_ID_ACCESS_ENABLED must be true or false")
+	}
+	if cfg.AccessEnabled && cfg.ClientSecret == "" {
+		return cfg, errors.New("mail access enforcement requires confidential client credentials")
+	}
 	if cfg.ClientID == "" {
 		return cfg, errors.New("MAIL_ID_CLIENT_ID is required")
 	}

@@ -47,16 +47,24 @@ func (h *handler) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, folder := range folders {
+		if r.Context().Err() != nil {
+			return
+		}
 		if encoder.Encode(map[string]any{"type": "folder", "folder": folder}) != nil {
 			return
 		}
 	}
 	for _, message := range mail {
+		if r.Context().Err() != nil {
+			return
+		}
 		if encoder.Encode(map[string]any{"type": "msg", "message": message}) != nil {
 			return
 		}
 	}
-	_ = encoder.Encode(map[string]any{"type": "ready", "syncId": cursor})
+	if r.Context().Err() == nil {
+		_ = encoder.Encode(map[string]any{"type": "ready", "syncId": cursor})
+	}
 }
 
 func (h *handler) history(w http.ResponseWriter, r *http.Request) {

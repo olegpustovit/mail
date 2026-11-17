@@ -1,0 +1,18 @@
+{
+  "active_recheck_seconds": 25,
+  "ambiguous_send_retained": true,
+  "interval_ms": 100,
+  "maximum_removal_ms": 60000,
+  "per_check_timeout_seconds": 2,
+  "policy_checks": 1977,
+  "policy_unavailable_ms": 24999,
+  "removal_ms": 25000,
+  "responses": {
+    "allowed": 5,
+    "denied": 975,
+    "unavailable": 975
+  },
+  "restoration": "pass",
+  "scope": "Owned Mongo + published SDK; simulated policy endpoint and mail transports; no production or actual provider claim",
+  "workers": 4
+}

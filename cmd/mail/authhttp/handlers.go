@@ -18,6 +18,7 @@ import (
 	idclient "github.com/olegpustovit/identity/idclient-go"
 
 	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mcp-icloud-email/internal/httpcancel"
 )
 
 type Handler struct {
@@ -40,13 +41,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/id/callback", h.limited(h.identity((*idclient.Client).Callback)))
 	mux.HandleFunc("POST /api/auth/id/logout", h.identity((*idclient.Client).Logout))
 	mux.HandleFunc("POST /auth/logout", h.logout)
-	mux.HandleFunc("GET /api/me", h.me)
-	mux.HandleFunc("PUT /api/account", h.account)
-	mux.HandleFunc("DELETE /api/account", h.account)
-	mux.HandleFunc("GET /api/clients", h.clients)
-	mux.HandleFunc("DELETE /api/clients/{id}", h.clients)
-	mux.HandleFunc("GET /api/sessions", h.sessions)
-	mux.HandleFunc("DELETE /api/sessions", h.sessions)
+	mux.HandleFunc("GET /api/me", h.access(h.me))
+	mux.HandleFunc("PUT /api/account", h.access(h.account))
+	mux.HandleFunc("DELETE /api/account", h.access(h.account))
+	mux.HandleFunc("GET /api/clients", h.access(h.clients))
+	mux.HandleFunc("DELETE /api/clients/{id}", h.access(h.clients))
+	mux.HandleFunc("GET /api/sessions", h.access(h.sessions))
+	mux.HandleFunc("DELETE /api/sessions", h.access(h.sessions))
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", publicOAuth(h.metadata))
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server/mcp", publicOAuth(h.metadata))
 	for _, path := range []string{"/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/oauth/register", "/oauth/token", "/oauth/revoke"} {
@@ -99,6 +100,9 @@ func (h *Handler) Session(r *http.Request) (string, error) {
 	}
 	if !auth.Allowed(v.Email) {
 		return "", auth.ErrUnauthorized
+	}
+	if err := h.s.CheckRecord(r.Context(), v, false); err != nil {
+		return "", err
 	}
 	return v.Email, nil
 }
@@ -165,7 +169,7 @@ func (h *Handler) account(w http.ResponseWriter, r *http.Request) {
 		if h.ValidateAccount != nil {
 			err = h.ValidateAccount(r.Context(), email, input.Email, input.Password)
 		} else {
-			connection, connectErr := icloudimap.NewClient(input.Email, input.Password)
+			connection, connectErr := icloudimap.NewClientContext(r.Context(), input.Email, input.Password)
 			err = connectErr
 			if err == nil {
 				_, err = connection.ListFolders(r.Context())
@@ -276,13 +280,22 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	email, e := h.Session(r)
 	if e != nil {
+		if errors.Is(e, auth.ErrAccessDenied) || errors.Is(e, auth.ErrAccessUnavailable) {
+			accessFailure(w, e)
+			return
+		}
 		// The target is the fixed local login path; the requested URL is only an escaped query value.
 		http.Redirect(w, r, loginURL(r.URL.RequestURI()), http.StatusSeeOther) //nolint:gosec
 		return
 	}
+	subject, _ := h.s.Subject(r.Context(), email)
+	if err := h.s.CheckSubject(r.Context(), subject, true); err != nil {
+		accessFailure(w, err)
+		return
+	}
 	if r.Method == "GET" {
 		t := auth.Random()
-		if e = h.s.Put(r.Context(), auth.Record{ID: auth.Hash(t), Kind: "consent", Email: email, Data: r.URL.RawQuery, Expires: time.Now().Add(10 * time.Minute)}); e != nil {
+		if e = h.s.Put(r.Context(), auth.Record{ID: auth.Hash(t), Kind: "consent", Email: email, Subject: subject, Data: r.URL.RawQuery, Expires: time.Now().Add(10 * time.Minute)}); e != nil {
 			fail(w, 500, "authorization_unavailable")
 			return
 		}
@@ -311,7 +324,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, e := h.s.Get(r.Context(), r.PostForm.Get("consent"), "consent", true)
-	if e != nil || c.Email != email || c.Data != r.URL.RawQuery {
+	if e != nil || c.Email != email || c.Data != r.URL.RawQuery || h.s.CheckRecord(r.Context(), c, true) != nil {
 		fail(w, 400, "invalid_consent")
 		return
 	}
@@ -322,7 +335,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) {
 		params.Set("error", "access_denied")
 	} else {
 		code := auth.Random()
-		e = h.s.Put(r.Context(), auth.Record{ID: auth.Hash(code), Kind: "code", Email: email, ClientID: clientID, Redirect: redirect, Challenge: q.Get("code_challenge"), Resource: h.s.Config.BaseURL + "/mcp", Expires: time.Now().Add(5 * time.Minute)})
+		e = h.s.Put(r.Context(), auth.Record{ID: auth.Hash(code), Kind: "code", Email: email, Subject: subject, ClientID: clientID, Redirect: redirect, Challenge: q.Get("code_challenge"), Resource: h.s.Config.BaseURL + "/mcp", Expires: time.Now().Add(5 * time.Minute)})
 		if e != nil {
 			fail(w, 500, "authorization_failed")
 			return
@@ -343,14 +356,14 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	var e error
 	switch f.Get("grant_type") {
 	case "authorization_code":
-		rec, e = h.s.Get(r.Context(), f.Get("code"), "code", true)
+		rec, e = h.s.Get(r.Context(), f.Get("code"), "code", false)
 		if e != nil || rec.ClientID != f.Get("client_id") || rec.Redirect != f.Get("redirect_uri") || len(f.Get("code_verifier")) < 43 || len(f.Get("code_verifier")) > 128 || auth.Hash(f.Get("code_verifier")) != rec.Challenge {
 			fail(w, 400, "invalid_grant")
 			return
 		}
 		rec.Family = auth.Random()
 	case "refresh_token":
-		rec, e = h.s.Get(r.Context(), f.Get("refresh_token"), "refresh", true)
+		rec, e = h.s.Get(r.Context(), f.Get("refresh_token"), "refresh", false)
 		if e != nil || rec.ClientID != f.Get("client_id") {
 			fail(w, 400, "invalid_grant")
 			return
@@ -361,6 +374,20 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	}
 	if !auth.Allowed(rec.Email) || (f.Get("resource") != "" && f.Get("resource") != rec.Resource) {
 		fail(w, 400, "invalid_target")
+		return
+	}
+	if err := h.s.CheckRecord(r.Context(), rec, true); err != nil {
+		accessFailure(w, err)
+		return
+	}
+	original := f.Get("code")
+	kind := "code"
+	if f.Get("grant_type") == "refresh_token" {
+		original = f.Get("refresh_token")
+		kind = "refresh"
+	}
+	if _, err := h.s.Get(r.Context(), original, kind, true); err != nil {
+		fail(w, 400, "invalid_grant")
 		return
 	}
 	access, refresh := auth.Random(), auth.Random()
@@ -421,5 +448,36 @@ func publicOAuth(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		next(w, r)
+	}
+}
+
+func accessFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, auth.ErrAccessUnavailable) {
+		fail(w, 503, "access_unavailable")
+	} else if errors.Is(err, auth.ErrAccessDenied) {
+		fail(w, 403, "access_denied")
+	} else {
+		fail(w, 401, "login_required")
+	}
+}
+func (h *Handler) access(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.s.AccessEnabled() {
+			next(w, r)
+			return
+		}
+		owner, err := h.Session(r)
+		if err != nil {
+			accessFailure(w, err)
+			return
+		}
+		ctx, cancel, err := h.s.WatchAccess(r.Context(), owner)
+		if err != nil {
+			accessFailure(w, err)
+			return
+		}
+		defer cancel()
+		defer httpcancel.Writes(ctx, w)()
+		next(w, r.WithContext(ctx))
 	}
 }

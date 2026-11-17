@@ -24,6 +24,7 @@ import (
 )
 
 type Service struct {
+	access      AccessGuard
 	client      *mongo.Client
 	db          *mongo.Database
 	credentials func(context.Context, string) (string, string, error)
@@ -84,10 +85,10 @@ const (
 	bulkLane
 )
 
-func New(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error)) (*Service, error) {
-	return newService(ctx, uri, key, credentials, "mail")
+func New(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error), guards ...AccessGuard) (*Service, error) {
+	return newService(ctx, uri, key, credentials, "mail", guards...)
 }
-func newService(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error), database string) (*Service, error) {
+func newService(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error), database string, guards ...AccessGuard) (*Service, error) {
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 32 {
 		return nil, errors.New("invalid mail encryption key")
@@ -112,8 +113,11 @@ func newService(ctx context.Context, uri, key string, credentials func(context.C
 	s := &Service{client: client, db: client.Database(database), cipher: aead, credentials: credentials, ctx: workerCtx, cancel: cancel, sessions: map[string]map[commandLane]*session{}, owners: map[string]*ownerState{}, monitors: map[string]*monitor{}, prefetch: make(chan prefetchRequest, 16), dialSync: func(ctx context.Context, address, password string, notify func()) (syncTransport, error) {
 		return imap.NewSyncClient(ctx, address, password, notify)
 	}}
+	if len(guards) > 0 {
+		s.access = guards[0]
+	}
 	s.dialCommand = func(ctx context.Context, address, password string) (*Connection, error) {
-		client, err := imap.NewClient(address, password)
+		client, err := imap.NewClientContext(ctx, address, password)
 		if err != nil {
 			return nil, err
 		}
@@ -227,7 +231,25 @@ func (s *Service) acquire(ctx context.Context, owner string, lane commandLane) (
 		entry.connection = connection
 		entry.fingerprint = fingerprint
 	}
-	return entry.connection, release, nil
+	borrowed := entry.connection
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		if client, ok := borrowed.Mail.(interface{ Abort() error }); ok {
+			_ = client.Abort()
+		}
+		close(finished)
+	})
+	releaseBorrowed := sync.OnceFunc(func() {
+		if !stop() {
+			<-finished
+		}
+		release()
+	})
+	if err := ctx.Err(); err != nil {
+		releaseBorrowed()
+		return nil, nil, err
+	}
+	return borrowed, releaseBorrowed, nil
 }
 
 // Credential checks borrow the command slot instead of opening a third IMAP session.
@@ -243,7 +265,7 @@ func (s *Service) ValidateAccount(ctx context.Context, owner, address, password 
 			return err
 		}
 	}
-	client, err := imap.NewClient(address, password)
+	client, err := imap.NewClientContext(ctx, address, password)
 	if err != nil {
 		return err
 	}
@@ -324,19 +346,31 @@ func (s *Service) Close(ctx context.Context) error {
 
 func (s *Service) keepSessions() {
 	s.mu.Lock()
-	var entries []*session
-	for _, lanes := range s.sessions {
+	type ownedEntry struct {
+		owner string
+		entry *session
+	}
+	var entries []ownedEntry
+	for owner, lanes := range s.sessions {
 		for _, entry := range lanes {
-			entries = append(entries, entry)
+			entries = append(entries, ownedEntry{owner, entry})
 		}
 	}
 	s.mu.Unlock()
-	for _, entry := range entries {
+	for _, owned := range entries {
+		entry := owned.entry
 		ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
+		work, release, err := s.ownerWork(ctx, owned.owner)
+		if err != nil {
+			cancel()
+			continue
+		}
+		ctx = work
+		finish := func() { release(); cancel() }
 		select {
 		case entry.gate <- struct{}{}:
 		case <-ctx.Done():
-			cancel()
+			finish()
 			continue
 		}
 		if connection := entry.connection; connection != nil && !connection.Mail.Closed() {
@@ -348,7 +382,7 @@ func (s *Service) keepSessions() {
 			}
 		}
 		<-entry.gate
-		cancel()
+		finish()
 	}
 }
 

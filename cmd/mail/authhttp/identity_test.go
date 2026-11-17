@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,8 @@ type provider struct {
 	codes         map[string]url.Values
 	sub, email    string
 	emailVerified bool
+	accessMode    atomic.Int32
+	accessChecks  atomic.Int32
 }
 
 func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +38,30 @@ func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	issuer := "http://" + r.Host
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
+	case "/api/access/check":
+		p.accessChecks.Add(1)
+		id, secret, ok := r.BasicAuth()
+		if !ok || id != "app_mail" || secret != "eval-confidential-secret" {
+			http.Error(w, "invalid client", 401)
+			return
+		}
+		if p.accessMode.Load() == 2 {
+			http.Error(w, "unavailable", 503)
+			return
+		}
+		var input struct {
+			UserID string `json:"user_id"`
+		}
+		if json.NewDecoder(r.Body).Decode(&input) != nil {
+			http.Error(w, "invalid", 422)
+			return
+		}
+		allowed := p.accessMode.Load() == 0
+		reason := "group_grant"
+		if !allowed {
+			reason = "user_block"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"client_id": "app_mail", "subject": input.UserID, "allowed": allowed, "reason_code": reason, "policy_revision": 1, "lease_seconds": 60})
 	case "/.well-known/openid-configuration":
 		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "/authorize", "token_endpoint": issuer + "/token", "jwks_uri": issuer + "/jwks", "id_token_signing_alg_values_supported": []string{"RS256"}})
 	case "/jwks":
@@ -62,7 +89,7 @@ func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func identityMux(t *testing.T) (*http.ServeMux, *auth.Service, *provider) {
+func identityMux(t *testing.T, enforced ...bool) (*http.ServeMux, *auth.Service, *provider) {
 	t.Helper()
 	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
 	if uri == "" {
@@ -77,7 +104,12 @@ func identityMux(t *testing.T) (*http.ServeMux, *auth.Service, *provider) {
 	t.Cleanup(server.Close)
 	s := testService(t, uri)
 	h := New(s)
-	if err = h.EnableIdentity(context.Background(), auth.IdentityConfig{Issuer: server.URL, ClientID: "app_mail", CookieKey: [32]byte{7}}); err != nil {
+	cfg := auth.IdentityConfig{Issuer: server.URL, ClientID: "app_mail", CookieKey: [32]byte{7}}
+	if len(enforced) > 0 && enforced[0] {
+		cfg.AccessEnabled = true
+		cfg.ClientSecret = "eval-confidential-secret"
+	}
+	if err = h.EnableIdentity(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()

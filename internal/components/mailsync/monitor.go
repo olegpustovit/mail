@@ -69,9 +69,14 @@ func (s *Service) Start(ctx context.Context, owner string) (*monitor, error) {
 			return nil, err
 		}
 		fingerprint := sha256.Sum256([]byte(account + "\x00" + password))
+		workCtx, release, err := s.ownerWork(s.ctx, owner)
+		if err != nil {
+			return nil, err
+		}
 		s.mu.Lock()
 		if generation != state.generation {
 			s.mu.Unlock()
+			release()
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -79,14 +84,16 @@ func (s *Service) Start(ctx context.Context, owner string) (*monitor, error) {
 		}
 		if err := s.ctx.Err(); err != nil {
 			s.mu.Unlock()
+			release()
 			return nil, err
 		}
-		if m := s.monitors[owner]; m != nil && m.fingerprint == fingerprint {
+		if m := s.monitors[owner]; m != nil && m.fingerprint == fingerprint && m.ctx.Err() == nil {
 			s.mu.Unlock()
+			release()
 			return m, nil
 		}
 		old := s.monitors[owner]
-		workerCtx, cancel := context.WithCancel(s.ctx)
+		workerCtx, cancel := context.WithCancel(workCtx)
 		m := &monitor{owner: owner, account: account, password: password, fingerprint: fingerprint, ctx: workerCtx, cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), wake: make(chan struct{}, 1), requests: make(chan refreshRequest, 16), folders: map[string]Folder{}, messages: map[string]map[uint32]Metadata{}}
 		s.monitors[owner] = m
 		s.wg.Add(1)
@@ -95,6 +102,7 @@ func (s *Service) Start(ctx context.Context, owner string) (*monitor, error) {
 			old.cancel()
 		}
 		go func() {
+			defer release()
 			defer s.wg.Done()
 			defer close(m.done)
 			if old != nil {
@@ -127,6 +135,12 @@ func (s *Service) Refresh(ctx context.Context, owner, actor, txID string, folder
 	return s.change(ctx, owner, actor, txID, folders, nil)
 }
 func (s *Service) change(ctx context.Context, owner, actor, txID string, folders []string, apply func(context.Context) error) error {
+	work, release, err := s.ownerWork(ctx, owner)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = work
 	var cancel context.CancelFunc
 	if apply != nil {
 		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)

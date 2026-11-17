@@ -33,6 +33,12 @@ func (s *Service) runPrefetch() {
 }
 
 func (s *Service) prefetchBodies(ctx context.Context, request prefetchRequest) error {
+	work, release, err := s.ownerWork(ctx, request.owner)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = work
 	rows, err := s.db.Collection("mail_messages").Find(ctx, bson.M{"owner": request.owner, "account": request.account, "email.folder": "INBOX", "body_cached": bson.M{"$ne": true}}, options.Find().SetSort(bson.D{{Key: "email.date", Value: -1}}).SetLimit(50))
 	if err != nil {
 		return err

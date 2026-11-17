@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 BINARY := mcp-icloud-email
 
-.PHONY: build web server test lint clean run vet
+.PHONY: build web server test lint clean run vet access-check access-rehearsal identity-provider-check
 
 build:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BINARY) .
@@ -15,6 +15,17 @@ server: web
 
 test:
 	go test -race ./...
+
+access-check:
+	bash scripts/test-owned-mongo.sh go test -race ./...
+
+access-rehearsal:
+	MAIL_ACCESS_REHEARSAL=1 bash scripts/test-owned-mongo.sh go test -race ./internal/components/mailsync -run '^TestAccessActiveWorkRehearsal$$' -count=1 -v
+
+# Requires the sibling Identity debug binary and its installed e2e dependencies.
+identity-provider-check:
+	CGO_ENABLED=0 go build -o mail-server ./cmd/mail
+	bash scripts/test-owned-mongo.sh bash -c 'cd ../identity && ID_E2E_SCENARIO=../mcp-icloud-email/e2e/identity-provider-scenario.mjs node e2e/run.mjs'
 
 vet:
 	go vet ./...

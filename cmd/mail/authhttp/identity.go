@@ -15,10 +15,16 @@ const sessionCookie = "__Host-mail_session"
 
 // EnableIdentity connects the handler to Microapps ID. It performs provider discovery, so call it at startup.
 func (h *Handler) EnableIdentity(ctx context.Context, cfg auth.IdentityConfig) error {
+	if err := h.s.EnableAccess(cfg); err != nil {
+		return err
+	}
 	client, err := idclient.New(ctx, idclient.Config{
 		Issuer: cfg.Issuer, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret,
 		RedirectURL: h.s.Config.BaseURL + "/api/auth/id/callback", CookieKey: cfg.CookieKey,
 		ResolveUser: func(ctx context.Context, claims idclient.Claims) (string, error) {
+			if err := h.s.CheckSubject(ctx, claims.Subject, true); err != nil {
+				return "", err
+			}
 			return h.s.LinkIdentity(ctx, claims.Subject, claims.Email)
 		},
 		Sessions: identitySessions{h},
@@ -62,9 +68,16 @@ func (s identitySessions) Create(w http.ResponseWriter, r *http.Request, email s
 			return err
 		}
 	}
+	subject, err := s.h.s.Subject(r.Context(), email)
+	if err != nil && s.h.s.AccessEnabled() {
+		return err
+	}
+	if err := s.h.s.CheckSubject(r.Context(), subject, false); err != nil {
+		return err
+	}
 	session := auth.Random()
 	ua := r.UserAgent()
-	if err := s.h.s.Put(r.Context(), auth.Record{ID: auth.Hash(session), Kind: "session", Email: email, Data: ua[:min(len(ua), 300)], Expires: time.Now().Add(7 * 24 * time.Hour)}); err != nil {
+	if err := s.h.s.Put(r.Context(), auth.Record{ID: auth.Hash(session), Kind: "session", Email: email, Subject: subject, Data: ua[:min(len(ua), 300)], Expires: time.Now().Add(7 * 24 * time.Hour)}); err != nil {
 		return err
 	}
 	s.h.cookie(w, sessionCookie, session, 7*86400)

@@ -291,13 +291,19 @@ func (s *Service) ApplyRules(ctx context.Context, owner, digest string) (RuleApp
 }
 func (s *Service) runRuleApplication(ctx context.Context) error {
 	var job RuleApplication
-	err := s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"state": "pending"}, options.FindOne().SetSort(bson.D{{Key: "created", Value: 1}})).Decode(&job)
+	err := s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"state": "pending", "$or": []bson.M{{"next_attempt": bson.M{"$exists": false}}, {"next_attempt": bson.M{"$lte": time.Now()}}}}, options.FindOne().SetSort(bson.D{{Key: "created", Value: 1}})).Decode(&job)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	work, release, allowed, err := s.jobWork(ctx, job.Owner, "mail_rule_applications", job.ID, "next_attempt")
+	if err != nil || !allowed {
+		return err
+	}
+	defer release()
+	ctx = work
 	state := s.owner(job.Owner)
 	state.write.Lock()
 	defer state.write.Unlock()
@@ -520,7 +526,19 @@ func (s *Service) runRuleJob(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	work, release, allowed, err := s.jobWork(ctx, job.Owner, "mail_rule_jobs", job.ID, "next_attempt")
+	if err != nil || !allowed {
+		return err
+	}
+	defer release()
+	ctx = work
 	if err = s.advanceRule(ctx, job); err != nil {
+		if ctx.Err() != nil {
+			maintenance, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer cancel()
+			_, e := s.db.Collection("mail_rule_jobs").UpdateOne(maintenance, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(30 * time.Second)}})
+			return e
+		}
 		if errors.Is(err, ErrRenamePending) {
 			_, e := s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(10 * time.Second), "error": "Paused until folder rename recovery completes."}})
 			return e

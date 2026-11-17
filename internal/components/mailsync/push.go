@@ -234,6 +234,12 @@ func cutText(value string, limit int) string {
 	return value
 }
 func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(context.Context, string, string) (bool, error), subject string, client *http.Client) error {
+	work, release, err := s.ownerWork(ctx, d.Owner)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = work
 	ok, err := valid(ctx, d.Owner, d.Session)
 	if err != nil {
 		return err

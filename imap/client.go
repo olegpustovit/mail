@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -133,30 +134,54 @@ type EmailFilters struct {
 
 // NewClient creates a new IMAP client configured for iCloud
 func NewClient(email, password string) (*Client, error) {
-	// Connect to iCloud IMAP server with TLS
-	addr := fmt.Sprintf("%s:%d", imapServer, imapPort)
-	c, err := client.DialWithDialerTLS(&net.Dialer{Timeout: timeout}, addr, nil)
+	return NewClientContext(context.Background(), email, password)
+}
+
+// NewClientContext bounds connection setup and closes the wire immediately when
+// an owner operation is cancelled, including greeting, login and initial select.
+func NewClientContext(ctx context.Context, email, password string) (*Client, error) {
+	dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: timeout}, Config: &tls.Config{ServerName: imapServer, MinVersion: tls.VersionTLS12}}
+	wire, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", imapServer, imapPort))
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to IMAP server: %w", err)
+		return nil, fmt.Errorf("connect IMAP: %w", err)
+	}
+	return newClientConnection(ctx, wire, email, password)
+}
+func newClientConnection(ctx context.Context, wire net.Conn, email, password string) (*Client, error) {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = wire.Close(); close(done) })
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
+	c, err := client.New(wire)
+	if err != nil {
+		_ = wire.Close()
+		return nil, fmt.Errorf("IMAP greeting: %w", err)
 	}
 	c.Timeout = timeout
-
-	// Login
-	if err := c.Login(email, password); err != nil {
-		_ = c.Logout()
-		return nil, fmt.Errorf("failed to login: %w", err)
+	if err = c.Login(email, password); err == nil {
+		_, err = c.Select("INBOX", false)
 	}
-
-	// Test connection by selecting INBOX
-	if _, err := c.Select("INBOX", false); err != nil {
-		_ = c.Logout()
-		return nil, fmt.Errorf("failed to select INBOX: %w", err)
+	if err == nil {
+		err = ctx.Err()
 	}
+	if err != nil {
+		_ = c.Terminate()
+		return nil, errors.New("IMAP authentication/setup failed")
+	}
+	return &Client{client: c, username: email}, nil
+}
 
-	return &Client{
-		client:   c,
-		username: email,
-	}, nil
+// Abort interrupts a borrowed command without waiting on the command mutex.
+// The underlying client supports concurrent termination, as its context-aware
+// command helpers already require. Its pointer is immutable after construction.
+func (c *Client) Abort() error {
+	if c.client == nil {
+		return nil
+	}
+	return c.client.Terminate()
 }
 
 // Close closes the IMAP connection

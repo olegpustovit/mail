@@ -284,6 +284,12 @@ func (s *Service) runMove(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	work, release, allowed, err := s.jobWork(ctx, job.Owner, "mail_moves", job.ID, "next_attempt")
+	if err != nil || !allowed {
+		return err
+	}
+	defer release()
+	ctx = work
 	box := &Mailbox{s: s, owner: job.Owner, account: job.Account, actor: "system"}
 	if job.State == "snoozed" {
 		err = box.returnMove(ctx, job.Transaction, false)

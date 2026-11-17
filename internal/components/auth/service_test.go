@@ -170,6 +170,8 @@ func TestLinkIdentity(t *testing.T) {
 }
 
 func TestIdentityConfigFromEnv(t *testing.T) {
+	t.Setenv("MAIL_ID_ACCESS_ENABLED", "")
+	t.Setenv("MAIL_ID_CLIENT_SECRET", "")
 	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
 	set := func(id, cookie string) {
 		t.Setenv("MAIL_ID_CLIENT_ID", id)
@@ -189,5 +191,22 @@ func TestIdentityConfigFromEnv(t *testing.T) {
 	cfg, e := IdentityConfigFromEnv()
 	if e != nil || cfg.Issuer != "https://id.microapps.space" || cfg.CookieKey[0] != 9 {
 		t.Fatal("valid configuration rejected", e)
+	}
+	if cfg.AccessEnabled {
+		t.Fatal("access enforcement did not default off")
+	}
+	t.Setenv("MAIL_ID_ACCESS_ENABLED", "true")
+	if _, e = IdentityConfigFromEnv(); e == nil {
+		t.Fatal("public client enabled confidential checks")
+	}
+	t.Setenv("MAIL_ID_CLIENT_SECRET", "eval-confidential-fixture")
+	if cfg, e = IdentityConfigFromEnv(); e != nil || !cfg.AccessEnabled {
+		t.Fatal("valid enforcement configuration rejected", e)
+	}
+	for _, value := range []string{"1", "TRUE", "yes", " false "} {
+		t.Setenv("MAIL_ID_ACCESS_ENABLED", value)
+		if _, e = IdentityConfigFromEnv(); e == nil {
+			t.Fatal("ambiguous access flag accepted")
+		}
 	}
 }

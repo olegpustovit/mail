@@ -35,6 +35,12 @@ docs/*
 !docs/design/
 docs/design/*
 !docs/design/web-client.html
+!docs/access-groups.md
+!docs/measurements/
+docs/measurements/*
+!docs/measurements/access-*.json
+__pycache__/
+e2e/test-results/
 
 mail-server
 .env.*

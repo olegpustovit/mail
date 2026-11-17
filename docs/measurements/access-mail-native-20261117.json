@@ -1,0 +1,12 @@
+{
+  "scope": "Owned actual Identity + Mail binaries, native PostgreSQL and Mongo, captured verified invitations and explicit reviewed policy",
+  "callback": "pass",
+  "local_restriction": "pass",
+  "callback_replay": "denied",
+  "cookie_mcp_oauth_refresh": "pass",
+  "removal_and_real_policy_storage_outage": "fail closed",
+  "refresh_restoration": "pass",
+  "blocked_cookie_logout": "pass",
+  "global_device_preserved": true,
+  "mailbox_network": "not used; separately covered with owned simulated IMAP/SMTP transports"
+}

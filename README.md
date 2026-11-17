@@ -8,7 +8,7 @@ Open https://mail.microapps.space and choose **Continue with Microapps ID**. Mic
 
 Add `https://mail.microapps.space/mcp` as a remote MCP server in your client and select OAuth authentication. Sign in with Microapps ID when the authorization page asks, then approve the client access request. Discovery, dynamic client registration, authorization code with PKCE, refresh tokens, and revocation are available. Client support depends on the client's remote MCP and OAuth capabilities; no iCloud password goes into client configuration.
 
-Each client grant permits reading, sending, and organizing your connected mailbox, including destructive operations. Only approve clients you trust. Disconnecting iCloud removes stored mailbox credentials; signing out ends the browser session. Revoke other browsers or individual MCP clients from settings; a Microapps ID account change does not sign out existing mail sessions.
+Each client grant permits reading, sending, and organizing your connected mailbox, including destructive operations. Only approve clients you trust. Disconnecting iCloud removes stored mailbox credentials; signing out ends the browser session. Revoke other browsers or individual MCP clients from settings. Optional central access enforcement checks existing sessions, MCP credentials and owner jobs against the stored Microapps ID subject; see [access integration and cutover](docs/access-groups.md).
 
 ## Run the hosted server
 
@@ -32,6 +32,7 @@ make server
 | `MAIL_ID_ISSUER` | Microapps ID issuer; defaults to `https://id.microapps.space` |
 | `MAIL_ID_CLIENT_ID` | Client ID of the Mail app registered in Microapps ID (required) |
 | `MAIL_ID_CLIENT_SECRET` | Client secret for a confidential registration (omit for a public PKCE client) |
+| `MAIL_ID_ACCESS_ENABLED` | Literal `true` or `false`; default false pending reviewed cutover. True requires a confidential client secret and stable subject bindings. |
 | `MAIL_ID_COOKIE_KEY` | Base64 encoding of an independent random 32-byte key for the sign-in flow cookie; `openssl rand -base64 32`, persisted across restarts, never the encryption key (required) |
 
 The server refuses to start without a valid Microapps ID configuration, and performs provider discovery at startup. Register the app in Microapps ID with the exact redirect URI `https://mail.microapps.space/api/auth/id/callback`. Sign-in uses `GET /api/auth/id/login`, `GET /api/auth/id/callback` and `POST /api/auth/id/logout`; the retired local routes (`POST /auth/login`, `/auth/register`, `/auth/resend`, `/auth/forgot`, `/auth/reset`, `GET /auth/verify`) answer 403 `{"code":"identity_required","error":"Sign in with Microapps ID."}`. The session cookie is `__Host-mail_session`.
@@ -91,6 +92,13 @@ go vet ./...
 # Include Mongo integration tests against a disposable test server:
 MAIL_TEST_MONGODB_URI=mongodb://127.0.0.1:27018 go test ./...
 # The auth service tests use disposable mail_test_* databases that they drop afterwards; never point the URI at production.
+# Start and clean an owned native loopback Mongo process for the full race suite:
+make access-check
+# Actual 25-second cancellation intervals, published SDK, simulated mail/policy transports:
+make access-rehearsal
+# Actual sibling Identity and Mail binaries, owned PostgreSQL + Mongo, verified sign-in:
+make identity-provider-check
+python3 -m unittest discover -s scripts -p test_deploy_guard.py
 ```
 
 The official MCP Go SDK owns protocol negotiation, Streamable HTTP and stdio framing, schema validation, and tool dispatch. Tool discovery does not connect to iCloud. Hosted tool calls share the owner's serialized command connection and mirror with the web client; the standalone stdio command closes its connection after the session.

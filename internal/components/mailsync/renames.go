@@ -312,6 +312,12 @@ func (s *Service) runRename(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	work, release, allowed, err := s.jobWork(ctx, op.Owner, "mail_folder_ops", op.ID, "next_attempt")
+	if err != nil || !allowed {
+		return err
+	}
+	defer release()
+	ctx = work
 	m, err := s.Mailbox(ctx, op.Owner, op.Actor)
 	if err == nil && m.account != op.Account {
 		_, err = s.db.Collection("mail_folder_ops").UpdateOne(ctx, bson.M{"_id": op.ID, "owner": op.Owner, "account": op.Account, "state": "pending"}, bson.M{"$set": bson.M{"state": "cancelled", "expires": time.Now().Add(14 * 24 * time.Hour)}})
