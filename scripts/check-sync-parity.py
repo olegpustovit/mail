@@ -90,7 +90,7 @@ def icloud_folders(email, password):
     client = imaplib.IMAP4_SSL("imap.mail.me.com", 993, timeout=30)
     try:
         client.login(email, password)
-        status, rows = client.list("", "*")
+        status, rows = client.list('""', "*")
         if status != "OK":
             raise RuntimeError(f"IMAP LIST failed: {status}")
         names = [mailbox_name(row) for row in rows]
