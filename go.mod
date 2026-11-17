@@ -12,7 +12,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/olegpustovit/identity/idclient-go v0.0.0-20261117021458-a8a6d8068d30
+	github.com/olegpustovit/identity/idclient-go v0.0.0-20261117122646-1181d4b686c2
 	go.mongodb.org/mongo-driver/v2 v2.4.4
 	golang.org/x/net v0.62.0
 )

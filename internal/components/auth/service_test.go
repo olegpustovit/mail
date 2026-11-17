@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -140,6 +141,18 @@ func TestLinkIdentity(t *testing.T) {
 	owner, e := s.LinkIdentity(ctx, "sub-1", " Person@OlegPustovit.com ")
 	if e != nil || owner != "person@olegpustovit.com" {
 		t.Fatal("first sign-in did not link the normalized email", owner, e)
+	}
+
+	if got, err := s.ResolveBoundIdentity(ctx, "sub-1", "person@olegpustovit.com"); err != nil || got != owner {
+		t.Fatal("existing unverified subject rejected", err)
+	}
+	if _, err := s.ResolveBoundIdentity(ctx, "sub-unbound", "person@olegpustovit.com"); err == nil {
+		t.Fatal("unverified email linked a new subject")
+	}
+	var count int64
+	count, e = s.db.Collection("identities").CountDocuments(ctx, bson.M{"_id": "sub-unbound"})
+	if e != nil || count != 0 {
+		t.Fatal("unverified resolution mutated bindings", e)
 	}
 	// A known subject keeps its owner even when the verified email changes.
 	if owner, e = s.LinkIdentity(ctx, "sub-1", "ursus95@gmail.com"); e != nil || owner != "person@olegpustovit.com" {

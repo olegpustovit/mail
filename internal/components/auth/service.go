@@ -320,3 +320,21 @@ func IdentityConfigFromEnv() (IdentityConfig, error) {
 	copy(cfg.CookieKey[:], key)
 	return cfg, nil
 }
+
+// ResolveBoundIdentity reads an existing subject mapping without linking email.
+func (s *Service) ResolveBoundIdentity(ctx context.Context, subject, email string) (string, error) {
+	if subject == "" || !Allowed(email) {
+		return "", ErrUnauthorized
+	}
+	if err := s.CheckSubject(ctx, subject, true); err != nil {
+		return "", err
+	}
+	var linked Identity
+	if err := s.db.Collection("identities").FindOne(ctx, bson.M{"_id": subject}).Decode(&linked); err != nil {
+		return "", ErrUnauthorized
+	}
+	if !Allowed(linked.Email) {
+		return "", ErrUnauthorized
+	}
+	return linked.Email, nil
+}

@@ -21,6 +21,9 @@ func (h *Handler) EnableIdentity(ctx context.Context, cfg auth.IdentityConfig) e
 	client, err := idclient.New(ctx, idclient.Config{
 		Issuer: cfg.Issuer, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret,
 		RedirectURL: h.s.Config.BaseURL + "/api/auth/id/callback", CookieKey: cfg.CookieKey,
+		ResolveUnverifiedUser: func(ctx context.Context, claims idclient.Claims) (string, error) {
+			return h.s.ResolveBoundIdentity(ctx, claims.Subject, claims.Email)
+		},
 		ResolveUser: func(ctx context.Context, claims idclient.Claims) (string, error) {
 			if err := h.s.CheckSubject(ctx, claims.Subject, true); err != nil {
 				return "", err
