@@ -41,11 +41,10 @@ The old `users` collection (password hashes) is no longer read; it stays in Mong
 
 Keep the encryption key backed up separately with your database backup. Replacing or losing it makes stored iCloud credentials unreadable. Secrets belong in private service environment files, never in Git.
 
-The production service runs on `oracle-vm` using [smdctl.yml](smdctl.yml), behind the existing HTTPS reverse proxy. Its private environment file is `~/.config/smdctl/env/mail.env` and its binary is `/home/snowbear/ci/mail/mail-server`.
+The production service runs on `oracle-vm` as the Aquifer app `mail`, behind the existing HTTPS reverse proxy. Its environment lives in the Aquifer vault (`ssh oracle-vm aq secret ls mail`). `scripts/deploy.sh` builds locally and runs `ssh oracle-vm aq deploy mail <binary>`.
 
 ```sh
-smdctl run -f smdctl.yml
-smdctl status mail
+ssh oracle-vm aq status mail
 curl https://mail.microapps.space/healthz
 curl https://mail.microapps.space/healthz/sync
 ```
@@ -98,7 +97,6 @@ make access-check
 make access-rehearsal
 # Actual sibling Identity and Mail binaries, owned PostgreSQL + Mongo, verified sign-in:
 make identity-provider-check
-python3 -m unittest discover -s scripts -p test_deploy_guard.py
 ```
 
 The official MCP Go SDK owns protocol negotiation, Streamable HTTP and stdio framing, schema validation, and tool dispatch. Tool discovery does not connect to iCloud. Hosted tool calls share the owner's serialized command connection and mirror with the web client; the standalone stdio command closes its connection after the session.

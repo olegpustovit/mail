@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deploy the mail app to oracle-vm through Aquifer (see the aquifer-deploy skill).
 set -Eeuo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,69 +17,30 @@ fi
 skip_parity=${MAIL_DEPLOY_SKIP_PARITY:-0}
 [[ "$skip_parity" == 1 || ( -n "${ICLOUD_EMAIL:-}" && -n "${ICLOUD_PASSWORD:-}" ) ]]
 
-# Read-only preflight: binary deployment keeps the current enforcement mode.
-# Provider policy restoration is separate; rollback must never turn checks off.
-ssh oracle-vm python3 - check --root /home/snowbear/ci/mail --env-file /home/snowbear/.config/smdctl/env/mail.env < scripts/deploy-guard.py
-
 version=$(git rev-parse --short HEAD)
-deploy_key=$(python3 -c 'import secrets; print(secrets.token_hex(12))')
 cd web
 npm ci
 npm test
 npm run build
 cd ..
 bash scripts/test-owned-mongo.sh go test -race ./...
-python3 -m unittest discover -s scripts -p 'test_deploy_guard.py'
 go vet ./...
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$version" -o "/tmp/mail-server-$version" ./cmd/mail
-binary_digest=$(sha256sum "/tmp/mail-server-$version" | cut -d' ' -f1)
-scp "/tmp/mail-server-$version" "oracle-vm:/home/snowbear/ci/mail/mail-server.next-$deploy_key"
-scp scripts/deploy-guard.py "oracle-vm:/home/snowbear/ci/mail/.deploy-guard-$deploy_key.py"
-ssh oracle-vm bash -s -- "$deploy_key" "$version" "$binary_digest" <<'REMOTE'
-set -euo pipefail
-cd /home/snowbear/ci/mail
-python3 ".deploy-guard-$1.py" capture --root . --env-file /home/snowbear/.config/smdctl/env/mail.env --key "$1" --version "$2" --digest "$3"
-REMOTE
+scp "/tmp/mail-server-$version" "oracle-vm:/tmp/mail-server-$version"
+status=0
+ssh oracle-vm aq deploy mail "/tmp/mail-server-$version" || status=$?
+ssh oracle-vm unlink "/tmp/mail-server-$version"
+((status == 0)) || exit "$status"
 
-deployed=0
 rollback() {
-  local status=$?
+  local result=$?
   trap - ERR
-  if [[ $deployed == 1 ]]; then
-    if ! ssh oracle-vm bash -s -- "$deploy_key" <<'REMOTE'
-set -euo pipefail
-cd /home/snowbear/ci/mail
-guard=(python3 ".deploy-guard-$1.py" --root . --env-file /home/snowbear/.config/smdctl/env/mail.env --key "$1")
-"${guard[@]}" rollback
-smdctl restart mail
-"${guard[@]}" verify-previous
-REMOTE
-    then
-      echo 'Rollback guard failed; inspect the captured deployment privately. No environment or policy was rewritten.' >&2
-    fi
-  fi
-  exit "$status"
+  ssh oracle-vm aq rollback mail || echo 'Rollback failed; inspect with ssh oracle-vm aq status mail' >&2
+  exit "$result"
 }
 trap rollback ERR
 
-# Set before activation so a failed restart/health check also restores the binary.
-deployed=1
-ssh oracle-vm bash -s -- "$deploy_key" <<'REMOTE'
-set -euo pipefail
-cd /home/snowbear/ci/mail
-guard=(python3 ".deploy-guard-$1.py" --root . --env-file /home/snowbear/.config/smdctl/env/mail.env --key "$1")
-"${guard[@]}" activate
-smdctl restart mail
-smdctl status mail | grep -F 'Status:  active (running)'
-"${guard[@]}" verify
-curl -fsS http://127.0.0.1:4290/healthz/sync >/dev/null
-for attempt in {1..12}; do
-  if ss -tnp | grep mail-server | grep -q ':993'; then exit 0; fi
-  sleep 5
-done
-echo 'S0 FAIL: no iCloud IMAP sync socket' >&2
-exit 1
-REMOTE
+ssh oracle-vm curl -fsS http://127.0.0.1:4290/healthz/sync >/dev/null
 curl -fsS https://mail.microapps.space/ >/dev/null
 curl -fsS https://mail.microapps.space/healthz/sync
 
@@ -92,10 +54,5 @@ else
     sleep 10
   done
 fi
-ssh oracle-vm bash -s -- "$deploy_key" <<'REMOTE'
-set -euo pipefail
-cd /home/snowbear/ci/mail
-python3 ".deploy-guard-$1.py" verify --root . --env-file /home/snowbear/.config/smdctl/env/mail.env --key "$1"
-REMOTE
 trap - ERR
 echo "Deploy PASS: $version"
