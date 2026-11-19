@@ -9,7 +9,7 @@
 
 Three bets:
 
-1. **The server keeps one mirror per user.** The Go binary holds a persistent IMAP session per connected account (IDLE + CONDSTORE). It mirrors mailbox metadata into MongoDB and writes every change into a per-user, monotonically numbered **changelog**, like Linear's `lastSyncId`.
+1. **The server keeps one mirror per user.** The Go binary holds a persistent IMAP session per connected account (IDLE + CONDSTORE). It mirrors mailbox metadata into PostgreSQL and writes every change into a per-user, monotonically numbered **changelog**, like Linear's `lastSyncId`.
 2. **The browser is a replica, not a viewer.** A Web Worker holds the mailbox in IndexedDB, bootstraps once, then tails the changelog over Server-Sent Events. Every read is local (0 network), and every write is an optimistic transaction confirmed later. That is how the client can beat Mail.app on perceived latency: Mail.app waits on IMAP round-trips, and we never do on the hot path.
 3. **Agents and humans share one write path.** MCP tools stop opening throwaway IMAP connections and go through the same session manager and mutation log. When Claude archives a thread through MCP, the human sees it leave the inbox within about 100 ms, tagged `AGENT`. The reverse holds too: MCP reads hit the warm mirror.
 
@@ -39,7 +39,7 @@ It still ships as one binary: `go build ./cmd/mail` embeds the React app, the se
 | `internal/components/auth` | Users, sessions (`__Host-mail_session`, HttpOnly, Secure, Lax), AES-GCM iCloud creds, OAuth grants | Session auth for the web client as-is; OAuth grants list for the Agents page |
 | `imap/client.go` | go-imap **v1**, one connection per MCP call, full-message fetch, search, flags incl. Apple flag colors, folders, drafts, SaveSent | Parsing (`parseEmailBody`, attachments, `sentFolder`), migrate transport to go-imap **v2** |
 | `smtp/` | STARTTLS 587, saves copy to Sent | Unchanged; called from the outbox worker |
-| `internal/components/mailcache` | 1-minute Mongo cache of full messages, invalidated on mutation | Superseded by the mirror (`mailsync`). Delete after migration |
+| `internal/components/mailcache` | 1-minute Postgres cache of full messages, invalidated on mutation | Superseded by the mirror (`mailsync`). Delete after migration |
 | `tools/` | 14 MCP tools on `tools.EmailService` interface | Keep the interface; back it with `mailsync` instead of a fresh IMAP client |
 | `web/` | React 19 + Vite 8, no other deps | Same stack; the mail client becomes the main route, settings move into it |
 
@@ -60,20 +60,20 @@ It still ships as one binary: `go build ./cmd/mail` embeds the React app, the se
 │ Service worker                 │                │  │ conn A: IDLE on INBOX           │──┼──────────▶
 │  • app shell precache          │                │  │ conn B: commands + poll others  │──┼──────────▶
 │  • push, badge, outbox wake    │                │  └─────────────┬───────────────────┘  │
-└───────────────────────────────┘                │   Mongo: messages, folders,           │  SMTP 587
+└───────────────────────────────┘                │   Postgres: messages, folders,           │  SMTP 587
                                                   │   changelog, tx, outbox, prefs        │──────────▶
  MCP clients (Claude etc.) ──── /mcp (OAuth) ───▶│ mailmcp → tools → mailsync            │
                                                   └───────────────────────────────────────┘
 ```
 
 New code lives where the codebase already puts it (`build-go-stack` layout):
-- `internal/components/mailsync/`: session manager, mirror, changelog, mutation applier, outbox and scheduler. Owns its Mongo collections.
+- `internal/components/mailsync/`: session manager, mirror, changelog, mutation applier, outbox and scheduler. Owns its Postgres collections.
 - `cmd/mail/syncapi/`: HTTP transport (bootstrap, SSE, mutate, body, attachment, image proxy), composed in `cmd/mail/main.go` like `authhttp`.
 - `web/src/`: client app, `web/src/replica/` (worker), `web/public/sw.js`, `manifest.webmanifest`.
 
 ## 5. Sync engine
 
-### 5.1 Server mirror (IMAP → Mongo)
+### 5.1 Server mirror (IMAP → Postgres)
 
 Per connected account the session manager keeps **two** IMAP connections. iCloud caps concurrent sessions per account (reports range from about 10 to 15), and the user's own Apple devices use some of them, so we never exceed two.
 
@@ -104,7 +104,7 @@ Every mirror write appends `{_id: syncId, owner, entity: "msg"|"folder"|"thread"
 | `GET /api/body/:msgKey` | Sanitized HTML + text + attachment manifest. `Cache-Control: private, max-age=31536000, immutable`, because a UID plus UIDVALIDITY never changes content |
 | `GET /api/att/:msgKey/:part` | Streams one MIME part (`BODY.PEEK[n]`). No full-message download (today's code fetches all of it) |
 | `GET /api/img?u=…&sig=…` | Remote image proxy. HMAC-signed URLs, blocks private IP ranges (SSRF), strips cookies and referrer, max 10 MB, image MIME only. Hides the reader's IP from trackers |
-| `GET /api/search?q=` | Server search over the Mongo mirror (text index on subject/from/to/snippet), with IMAP `SEARCH` fallback for bodies |
+| `GET /api/search?q=` | Server search over the Postgres mirror (text index on subject/from/to/snippet), with IMAP `SEARCH` fallback for bodies |
 
 All of these routes sit behind the existing session cookie and `Origin` check. `/mcp` keeps bearer OAuth.
 
@@ -203,11 +203,11 @@ Chords time out after 900 ms and show a `g _` HUD in the status bar. Every menu 
 - Same-origin cookie session + strict `Origin` check (existing `protect`/authhttp patterns). Mutations require `Content-Type: application/json` and a matching `Origin`.
 - CSP gains: `worker-src 'self'`, `frame-src 'self'`, `manifest-src 'self'`, `img-src 'self' data: blob:` (remote images only via `/api/img`). The email iframe has no `allow-scripts` and no `allow-same-origin`.
 - HTML sanitization server-side (bluemonday UGC policy + style allowlist), with the iframe sandbox as a second layer. `cid:` images are rewritten to `/api/att`.
-- Mirror data is user-scoped by `owner` on every query (same as `mailcache`). Bodies are **not** stored in Mongo; they stay on IMAP plus the browser cache. Only metadata, snippets and the 512-byte preview are mirrored, which narrows what DB access exposes compared with today's cache.
+- Mirror data is user-scoped by `owner` on every query (same as `mailcache`). Bodies are **not** stored in Postgres; they stay on IMAP plus the browser cache. Only metadata, snippets and the 512-byte preview are mirrored, which narrows what DB access exposes compared with today's cache.
 - The image proxy uses HMAC-signed URLs, denies private/link-local IPs after DNS resolution, enforces a size cap and timeout, and validates content types.
 - Logout and password reset already revoke sessions. Additionally clear IDB via `Clear-Site-Data: "storage"` on logout.
 
-## 12. Data model (Mongo, db `mail`)
+## 12. Data model (Postgres, db `mail`)
 
 ```
 sync_accounts   {_id, owner, account, folders:{name:{uidvalidity, uidnext, highestmodseq, count}}, status, lastError}
@@ -242,7 +242,7 @@ Test strategy follows the repo: Go table tests with a fake IMAP backend (go-imap
 | QRESYNC inconsistent on iCloud | Not used; STATUS count + UID SEARCH diff for expunges |
 | CONDSTORE absent on some shard | Bounded flag-poll fallback (§5.1) |
 | Server holds always-on IMAP sessions → memory per user | About 200 KB per session; fine for the invite-only user base (registration is allowlisted) |
-| Mongo text search quality | Good enough for metadata; IMAP `SEARCH BODY` fallback; SQLite FTS5 can be revisited if needed |
+| Postgres text search quality | Good enough for metadata; IMAP `SEARCH BODY` fallback; SQLite FTS5 can be revisited if needed |
 | go-imap v2 is still beta (`v2.0.0-beta.8`) | Pin the version; it's the maintained line and has IDLE/MOVE/UIDPLUS/SORT/QUOTA plus a test server |
 | Sanitizer bypass | Two layers (bluemonday + script-less sandboxed iframe with CSP) |
 
