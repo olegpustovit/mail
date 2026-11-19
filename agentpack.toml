@@ -7,6 +7,6 @@ version = "0.0.1"
 "github.com/olegpustovit/agent-configs/mcps/playwright" = "dev"
 "github.com/olegpustovit/agent-configs/drafts/build-go-stack" = "dev"
 "github.com/dietrichgebert/ponytail" = {}
-"github.com/olegpustovit/agent-configs/skills/smdctl-deploy" = "dev"
+"github.com/olegpustovit/aquifer/skills/aquifer-deploy" = "dev"
 "github.com/pbakaus/impeccable" = {}
 # "github.com/owner/repo/path" = {}

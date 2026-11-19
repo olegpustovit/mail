@@ -40,16 +40,16 @@ cache_key = '34a182c279db42196f4cb8109ba7b6462ac4c31a146abb7849d2e975d5d6ae8f'
 content_hash = 'sha256-tree-v1:70e653d2cf61f80e08667ad2a197973a9cb5bf058022b7091d6a1aeb2d84e0c9'
 
 [[packages]]
-module = 'github.com/olegpustovit/agent-configs/skills/smdctl-deploy'
+module = 'github.com/olegpustovit/aquifer/skills/aquifer-deploy'
 direct = true
 kind = 'skill'
-url = 'https://github.com/olegpustovit/agent-configs/tree/dev/skills/smdctl-deploy'
+url = 'https://github.com/olegpustovit/aquifer/tree/dev/skills/aquifer-deploy'
 owner = 'olegpustovit'
-repo = 'agent-configs'
-path = 'skills/smdctl-deploy'
-commit = '5ace3e7a37d84481a4ad9ae5d85563a2525c2242'
-cache_key = '6943edf1ca76a46a341b924bef78a3ab20d2b4d03d3ba25d19f3996764f71f34'
-content_hash = 'sha256-tree-v1:a40a0bd33c8ebeb1244c380f6398eb0e372d186ad83feb559e9b9728bc306c73'
+repo = 'aquifer'
+path = 'skills/aquifer-deploy'
+commit = 'aa9518b1ac77ac628f52b9a58fb97d4fd782fefe'
+cache_key = '82d802d4fc4d4bb46df6555b7dd634adaec119c46532b5bd322c561f5c01189a'
+content_hash = 'sha256-tree-v1:3aecd97bd091efd92160bf482354a1a8634f4e944f885ff962cb8fde2f5b8427'
 
 [[packages]]
 module = 'github.com/pbakaus/impeccable'
