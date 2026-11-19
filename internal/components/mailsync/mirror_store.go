@@ -161,7 +161,7 @@ CREATE INDEX IF NOT EXISTS mail_changelog_uncommitted ON mail_changelog (owner, 
 CREATE INDEX IF NOT EXISTS mail_changelog_status ON mail_changelog (entity, status_phase, at);
 `
 
-// Mongo's 14-day TTL on committed journal rows.
+// Committed journal rows expire after 14 days.
 const sweepChangelog = `DELETE FROM mail_changelog WHERE committed AND at < now() - interval '14 days'`
 
 // Metadata, Folder, SyncStatus and RuleJob hide internal fields from the API with json:"-";

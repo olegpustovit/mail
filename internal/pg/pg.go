@@ -72,13 +72,13 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, ddl string) error {
 	return err
 }
 
-// IsUnique reports a unique-constraint violation (Mongo's duplicate key).
+// IsUnique reports a unique-constraint violation.
 func IsUnique(err error) bool {
 	var e *pgconn.PgError
 	return errors.As(err, &e) && e.Code == "23505"
 }
 
-// Sweep deletes expired rows (Mongo TTL indexes) every interval until ctx ends. Each stmt is a full DELETE.
+// Sweep deletes expired rows every interval until ctx ends. Each stmt is a full DELETE.
 func Sweep(ctx context.Context, pool *pgxpool.Pool, interval time.Duration, stmts ...string) {
 	go func() {
 		t := time.NewTicker(interval)

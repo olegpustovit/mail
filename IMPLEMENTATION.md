@@ -1,6 +1,6 @@
 # Terminal Mail implementation and verification ledger
 
-> Storage moved from MongoDB to PostgreSQL on 2026-11-19; older notes below were rewritten for the new store.
+> Storage is PostgreSQL; the notes below describe the current store.
 
 Authority: artifact mx4gywdnv23g, version 3 (docs/design/web-client.html), with PROPOSAL.md as technical context. Current release status is recorded at the end. Dated progress entries preserve the implementation history; fixture checks and live checks are identified separately.
 

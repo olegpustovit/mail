@@ -37,7 +37,7 @@ func (*interruptedAccessSender) ReplyToEmail(context.Context, *imap.Email, strin
 	panic("unexpected reply")
 }
 
-// This deliberately uses the production timer intervals, real Mongo storage and
+// This deliberately uses the production timer intervals, real Postgres storage and
 // the published access SDK. The policy endpoint and mail transports are owned
 // fakes: no external ID grant, mailbox or SMTP recipient is touched.
 func TestAccessActiveWorkRehearsal(t *testing.T) {
@@ -155,7 +155,7 @@ func TestAccessActiveWorkRehearsal(t *testing.T) {
 		})
 	}
 	defer func() { stopLoad(); load.Wait() }()
-	measurements := map[string]any{"scope": "Owned Mongo + published SDK; simulated policy endpoint and mail transports; no production or actual provider claim", "workers": 4, "interval_ms": 100, "active_recheck_seconds": 25, "per_check_timeout_seconds": 2, "maximum_removal_ms": 60000}
+	measurements := map[string]any{"scope": "Postgres + published SDK; simulated policy endpoint and mail transports; no production or actual provider claim", "workers": 4, "interval_ms": 100, "active_recheck_seconds": 25, "per_check_timeout_seconds": 2, "maximum_removal_ms": 60000}
 	for _, phase := range []struct {
 		name  string
 		mode  int32

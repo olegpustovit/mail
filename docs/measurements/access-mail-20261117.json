@@ -13,6 +13,6 @@
     "unavailable": 975
   },
   "restoration": "pass",
-  "scope": "Owned Mongo + published SDK; simulated policy endpoint and mail transports; no production or actual provider claim",
+  "scope": "Owned PostgreSQL + published SDK; simulated policy endpoint and mail transports; no production or actual provider claim",
   "workers": 4
 }

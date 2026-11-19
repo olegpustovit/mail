@@ -1,5 +1,5 @@
 {
-  "scope": "Owned actual Identity + Mail binaries, native PostgreSQL and Mongo, captured verified invitations and explicit reviewed policy",
+  "scope": "Owned actual Identity + Mail binaries, native PostgreSQL, captured verified invitations and explicit reviewed policy",
   "callback": "pass",
   "local_restriction": "pass",
   "callback_replay": "denied",
