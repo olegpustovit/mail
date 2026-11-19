@@ -54,28 +54,16 @@ def encode_utf7(value):
 
 
 def remote_mirror(account):
-    script = r'''set -euo pipefail
-ACCOUNT="$1"
-export MAIL_PARITY_ACCOUNT="$ACCOUNT"
-set -a
-. ~/.config/smdctl/env/mail.env
-set +a
-mongosh --quiet "$MAIL_MONGODB_URI" --eval '
-const account=process.env.MAIL_PARITY_ACCOUNT;
-const folders=db.mail_folders.aggregate([
- {$match:{account}},
- {$project:{owner:1,account:1,name:"$info.name",total:"$info.total",uidNext:"$info.uid_next"}},
- {$lookup:{from:"mail_messages",let:{o:"$owner",a:"$account",f:"$name"},pipeline:[
-  {$match:{$expr:{$and:[{$eq:["$owner","$$o"]},{$eq:["$account","$$a"]},{$eq:["$email.folder","$$f"]}]}}},{$count:"n"}
- ],as:"count"}},
- {$project:{_id:0,name:1,total:{$toDouble:"$total"},uidNext:{$toDouble:"$uidNext"},count:{$toDouble:{$ifNull:[{$first:"$count.n"},0]}}}}
-]).toArray();
-const status=db.mail_sync_status.find({account}).sort({at:-1}).limit(1).next();
-print(JSON.stringify({folders,status:status&&{phase:status.phase,at:status.at.toISOString()}}));'
-'''
+    # Runs as the VM user over the local Postgres socket; the account is passed as a psql variable.
+    sql = '''SELECT json_build_object(
+ 'folders', COALESCE((SELECT json_agg(json_build_object('name', f.name, 'total', (f.data->>'total')::float8, 'uidNext', (f.data->>'uidNext')::float8,
+   'count', (SELECT count(*) FROM mail_messages m WHERE m.owner = f.owner AND m.account = f.account AND m.folder = f.name)::float8))
+   FROM mail_folders f WHERE f.account = :'account'), '[]'::json),
+ 'status', (SELECT json_build_object('phase', data->>'phase', 'at', to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+   FROM mail_sync_status WHERE account = :'account' ORDER BY at DESC LIMIT 1));'''
     result = subprocess.run(
-        ["ssh", "oracle-vm", "bash", "-s", "--", account],
-        input=script,
+        ["ssh", "oracle-vm", "psql", "-d", "mail", "-At", "-v", f"account={account}"],
+        input=sql,
         text=True,
         capture_output=True,
         check=True,
@@ -83,7 +71,7 @@ print(JSON.stringify({folders,status:status&&{phase:status.phase,at:status.at.to
     for line in reversed(result.stdout.splitlines()):
         if line.startswith("{"):
             return json.loads(line)
-    raise RuntimeError("Mongo parity query returned no JSON")
+    raise RuntimeError("Postgres parity query returned no JSON")
 
 
 def icloud_folders(email, password):
