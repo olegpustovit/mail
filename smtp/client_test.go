@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 	"net/mail"
 	"slices"
 	"strings"

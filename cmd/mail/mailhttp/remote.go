@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/publichttp"
+	"github.com/olegpustovit/mail/internal/publichttp"
 	"golang.org/x/net/html"
 )
 

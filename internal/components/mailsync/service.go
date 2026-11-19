@@ -15,18 +15,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/pg"
+	"github.com/olegpustovit/mail/smtp"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type Service struct {
 	access      AccessGuard
-	client      *mongo.Client
-	db          *mongo.Database
+	pool        *pgxpool.Pool
 	credentials func(context.Context, string) (string, string, error)
 	cipher      cipher.AEAD
 	ctx         context.Context
@@ -85,10 +83,10 @@ const (
 	bulkLane
 )
 
-func New(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error), guards ...AccessGuard) (*Service, error) {
-	return newService(ctx, uri, key, credentials, "mail", guards...)
+func New(ctx context.Context, dsn, key string, credentials func(context.Context, string) (string, string, error), guards ...AccessGuard) (*Service, error) {
+	return newService(ctx, dsn, key, credentials, "", guards...)
 }
-func newService(ctx context.Context, uri, key string, credentials func(context.Context, string) (string, string, error), database string, guards ...AccessGuard) (*Service, error) {
+func newService(ctx context.Context, dsn, key string, credentials func(context.Context, string) (string, string, error), schema string, guards ...AccessGuard) (*Service, error) {
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil || len(decoded) != 32 {
 		return nil, errors.New("invalid mail encryption key")
@@ -101,16 +99,16 @@ func newService(ctx context.Context, uri, key string, credentials func(context.C
 	if err != nil {
 		return nil, err
 	}
-	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetTimeout(10 * time.Second))
+	pool, err := pg.Open(ctx, dsn, schema)
 	if err != nil {
 		return nil, fmt.Errorf("connect mail sync: %w", err)
 	}
-	if err = client.Ping(ctx, nil); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("ping mail sync: %w", err)
+	if err = pg.Migrate(ctx, pool, ddlMirror+ddlMoves+ddlOutbox); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("migrate mail sync: %w", err)
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
-	s := &Service{client: client, db: client.Database(database), cipher: aead, credentials: credentials, ctx: workerCtx, cancel: cancel, sessions: map[string]map[commandLane]*session{}, owners: map[string]*ownerState{}, monitors: map[string]*monitor{}, prefetch: make(chan prefetchRequest, 16), dialSync: func(ctx context.Context, address, password string, notify func()) (syncTransport, error) {
+	s := &Service{pool: pool, cipher: aead, credentials: credentials, ctx: workerCtx, cancel: cancel, sessions: map[string]map[commandLane]*session{}, owners: map[string]*ownerState{}, monitors: map[string]*monitor{}, prefetch: make(chan prefetchRequest, 16), dialSync: func(ctx context.Context, address, password string, notify func()) (syncTransport, error) {
 		return imap.NewSyncClient(ctx, address, password, notify)
 	}}
 	if len(guards) > 0 {
@@ -123,35 +121,18 @@ func newService(ctx context.Context, uri, key string, credentials func(context.C
 		}
 		return &Connection{Mail: client, Sender: smtp.NewClient(address, password, client.SaveSent), Address: address}, nil
 	}
-	for collection, models := range map[string][]mongo.IndexModel{
-		"mail_rule_jobs":         {{Keys: bson.D{{Key: "state", Value: 1}, {Key: "next_attempt", Value: 1}, {Key: "created", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "state", Value: 1}}}, {Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
-		"mail_rule_applications": {{Keys: bson.D{{Key: "state", Value: 1}, {Key: "created", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}}}, {Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
-		"mail_push_devices":      {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}}}, {Keys: bson.D{{Key: "next_attempt", Value: 1}}}},
-		"mail_folder_ops":        {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "state", Value: 1}}}, {Keys: bson.D{{Key: "state", Value: 1}, {Key: "next_attempt", Value: 1}}}, {Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
-		"mail_outbox":            {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "created", Value: -1}}}, {Keys: bson.D{{Key: "status", Value: 1}, {Key: "send_at", Value: 1}}}, {Keys: bson.D{{Key: "payload_expires", Value: 1}}}},
-		"mail_activity":          {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "at", Value: -1}}}},
-		"mail_moves":             {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "transaction", Value: 1}}, Options: options.Index().SetUnique(true)}, {Keys: bson.D{{Key: "state", Value: 1}, {Key: "next_attempt", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "current.folder", Value: 1}, {Key: "current.validity", Value: 1}, {Key: "current.uid", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "marker", Value: 1}}}, {Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)}},
-		"mail_messages":          {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "email.folder", Value: 1}, {Key: "email.date", Value: -1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "email.threadid", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "email.messageid", Value: 1}}}, {Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "subject_key", Value: 1}, {Key: "email.date", Value: -1}}}},
-		"mail_folders":           {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "info.name", Value: 1}}}},
-		"mail_changelog":         {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "seq", Value: 1}}, Options: options.Index().SetUnique(true)}, {Keys: bson.D{{Key: "at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(14 * 86400).SetPartialFilterExpression(bson.M{"committed": true})}, {Keys: bson.D{{Key: "entity", Value: 1}, {Key: "status.phase", Value: 1}, {Key: "at", Value: 1}}}},
-		"mail_thread_nodes":      {{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "account", Value: 1}, {Key: "thread", Value: 1}}}},
-	} {
-		if _, err = s.db.Collection(collection).Indexes().CreateMany(ctx, models); err != nil {
-			cancel()
-			_ = client.Disconnect(context.Background())
-			return nil, fmt.Errorf("index %s: %w", collection, err)
-		}
+	pg.Sweep(workerCtx, pool, time.Minute, append(append([]string{sweepChangelog}, sweepMoves...), sweepOutbox...)...)
+	fail := func(err error) (*Service, error) {
+		cancel()
+		pool.Close()
+		return nil, err
 	}
 	if err = s.recoverOwner(ctx, ""); err != nil {
-		cancel()
-		_ = client.Disconnect(context.Background())
-		return nil, err
+		return fail(err)
 	}
 	// A process crash during SMTP is ambiguous; never automatically send it twice.
-	if _, err = s.db.Collection("mail_outbox").UpdateMany(ctx, bson.M{"status": "sending"}, bson.M{"$set": bson.M{"status": "uncertain", "error": "Server restarted during delivery; check Sent before retrying."}}); err != nil {
-		cancel()
-		_ = client.Disconnect(context.Background())
-		return nil, err
+	if _, err = pool.Exec(ctx, `UPDATE mail_outbox SET status = 'uncertain', error = 'Server restarted during delivery; check Sent before retrying.' WHERE status = 'sending'`); err != nil {
+		return fail(err)
 	}
 	s.wg.Add(4)
 	go s.runJobs()
@@ -305,25 +286,31 @@ func (s *Service) Invalidate(ctx context.Context, owner string, disconnect bool)
 	}
 	state.write.Lock()
 	defer state.write.Unlock()
-	for _, collection := range []string{"mail_messages", "mail_folders", "mail_thread_nodes", "mail_changelog", "mail_push_devices", "mail_rule_jobs", "mail_rule_applications"} {
-		if _, err := s.db.Collection(collection).DeleteMany(ctx, bson.M{"owner": owner}); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	for _, table := range []string{"mail_messages", "mail_folders", "mail_thread_nodes", "mail_changelog", "mail_push_devices", "mail_rule_jobs", "mail_rule_applications", "mail_sync_status"} {
+		if _, err = tx.Exec(ctx, "DELETE FROM "+table+" WHERE owner = $1", owner); err != nil {
 			return err
 		}
 	}
-	if _, err := s.db.Collection("mail_sync_status").DeleteOne(ctx, bson.M{"_id": owner}); err != nil {
-		return err
-	}
-	_, err := s.db.Collection("mail_outbox").UpdateMany(ctx, bson.M{"owner": owner, "status": "pending"}, bson.M{"$set": bson.M{"status": "cancelled"}})
-	if err != nil {
-		return err
-	}
 	expires := time.Now().Add(14 * 24 * time.Hour)
-	_, err = s.db.Collection("mail_moves").UpdateMany(ctx, bson.M{"owner": owner}, bson.M{"$set": bson.M{"state": "cancelled", "expires": expires}, "$unset": bson.M{"next_attempt": ""}})
-	if err != nil {
-		return err
+	for _, q := range []string{
+		`UPDATE mail_outbox SET status = 'cancelled' WHERE owner = $1 AND status = 'pending'`,
+		`UPDATE mail_moves SET state = 'cancelled', expires = $2, next_attempt = NULL WHERE owner = $1`,
+		`UPDATE mail_folder_ops SET state = 'cancelled', expires = $2 WHERE owner = $1`,
+	} {
+		args := []any{owner}
+		if strings.Contains(q, "$2") {
+			args = append(args, expires)
+		}
+		if _, err = tx.Exec(ctx, q, args...); err != nil {
+			return err
+		}
 	}
-	_, err = s.db.Collection("mail_folder_ops").UpdateMany(ctx, bson.M{"owner": owner}, bson.M{"$set": bson.M{"state": "cancelled", "expires": expires}})
-	return err
+	return tx.Commit(ctx)
 }
 func (s *Service) Close(ctx context.Context) error {
 	s.cancel()
@@ -337,11 +324,8 @@ func (s *Service) Close(ctx context.Context) error {
 			}
 		}
 	}
-	err := s.client.Disconnect(ctx)
-	if errors.Is(err, mongo.ErrClientDisconnected) {
-		return nil
-	}
-	return err
+	s.pool.Close()
+	return nil
 }
 
 func (s *Service) keepSessions() {

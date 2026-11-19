@@ -4,15 +4,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func TestCachedEmailIsScopedToOwnerAccountFolderAndGeneration(t *testing.T) {
 	s := testMirror(t)
 	ctx := context.Background()
 	row := Metadata{Key: messageKey("alice", "mail@icloud.com", "INBOX", 7, "42"), Owner: "alice", Account: "mail@icloud.com", BodyCached: true, Email: imap.Email{ID: "42", Folder: "INBOX", UIDValidity: 7, BodyPlain: "private"}}
-	if _, err := s.db.Collection("mail_messages").InsertOne(ctx, row); err != nil {
+	if err := seedMessage(s, row); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -48,7 +47,7 @@ func TestCachedEmailIsScopedToOwnerAccountFolderAndGeneration(t *testing.T) {
 	if err != nil || len(journal) != 1 || journal[0].Message.BodyPlain != "" {
 		t.Fatalf("cached body leaked into the metadata journal: %v %v", journal, err)
 	}
-	if _, err := s.db.Collection("mail_messages").UpdateOne(ctx, bson.M{"_id": row.Key}, bson.M{"$set": bson.M{"body_cached": false}}); err != nil {
+	if _, err := s.pool.Exec(ctx, `UPDATE mail_messages SET body_cached = false WHERE key = $1`, row.Key); err != nil {
 		t.Fatal(err)
 	}
 	if email, err := mailbox.CachedEmail(ctx, "INBOX", "42", 7); err != nil || email != nil {

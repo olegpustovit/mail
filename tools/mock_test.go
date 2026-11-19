@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	smtppkg "github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/imap"
+	smtppkg "github.com/olegpustovit/mail/smtp"
 )
 
 // MockEmailService implements EmailService for testing.

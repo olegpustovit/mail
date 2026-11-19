@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
+	"github.com/olegpustovit/mail/internal/mailmcp"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type mailboxStub struct {

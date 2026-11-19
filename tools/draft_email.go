@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 )
 
 // DraftEmailHandler creates a handler for saving email drafts

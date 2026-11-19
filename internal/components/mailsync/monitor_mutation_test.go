@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func TestBlockedMutationHonorsRequestDeadline(t *testing.T) {
@@ -93,8 +92,7 @@ func TestBlockedMutationDoesNotBlockArrivalSync(t *testing.T) {
 	t.Logf("queued sync wake=%d", len(m.wake))
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		count, err := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner, "account": account, "email.id": "2"})
-		if err == nil && count == 1 {
+		if countMessages(s, "owner = $1 AND account = $2 AND uid = '2'", owner, account) == 1 {
 			select {
 			case err := <-request.done:
 				if !errors.Is(err, context.DeadlineExceeded) {

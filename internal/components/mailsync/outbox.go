@@ -10,12 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmessage"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/jackc/pgx/v5"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/mailmessage"
+	"github.com/olegpustovit/mail/internal/pg"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 type Send struct {
@@ -39,18 +38,80 @@ type Send struct {
 	Attachments   []mailmessage.Attachment `json:"attachments"`
 }
 type Outbox struct {
-	ID             string     `bson:"_id" json:"id"`
-	Owner          string     `bson:"owner" json:"-"`
-	Account        string     `bson:"account" json:"-"`
-	Payload        []byte     `bson:"payload" json:"-"`
-	SendAt         time.Time  `bson:"send_at" json:"sendAt"`
-	Created        time.Time  `bson:"created" json:"created"`
-	Status         string     `bson:"status" json:"status"`
-	RetryAt        time.Time  `bson:"retry_at,omitempty" json:"-"`
-	Error          string     `bson:"error,omitempty" json:"error,omitempty"`
-	Message        *Send      `bson:"-" json:"message,omitempty"`
-	Actor          string     `bson:"actor,omitempty" json:"actor,omitempty"`
-	PayloadExpires *time.Time `bson:"payload_expires,omitempty" json:"-"`
+	ID             string     `json:"id"`
+	Owner          string     `json:"-"`
+	Account        string     `json:"-"`
+	Payload        []byte     `json:"-"`
+	SendAt         time.Time  `json:"sendAt"`
+	Created        time.Time  `json:"created"`
+	Status         string     `json:"status"`
+	RetryAt        time.Time  `json:"-"`
+	Error          string     `json:"error,omitempty"`
+	Message        *Send      `json:"message,omitempty"`
+	Actor          string     `json:"actor,omitempty"`
+	PayloadExpires *time.Time `json:"-"`
+}
+
+const ddlOutbox = `
+CREATE TABLE IF NOT EXISTS mail_outbox (
+	id text PRIMARY KEY,
+	owner text NOT NULL,
+	account text NOT NULL,
+	payload bytea,
+	send_at timestamptz NOT NULL,
+	created timestamptz NOT NULL,
+	status text NOT NULL,
+	retry_at timestamptz NOT NULL DEFAULT 'epoch',
+	error text NOT NULL DEFAULT '',
+	actor text NOT NULL DEFAULT '',
+	payload_expires timestamptz
+);
+CREATE INDEX IF NOT EXISTS mail_outbox_owner_created ON mail_outbox (owner, created DESC);
+CREATE INDEX IF NOT EXISTS mail_outbox_status_send ON mail_outbox (status, send_at);
+CREATE INDEX IF NOT EXISTS mail_outbox_payload_expires ON mail_outbox (payload_expires) WHERE payload_expires IS NOT NULL;
+CREATE TABLE IF NOT EXISTS mail_push_devices (
+	id text PRIMARY KEY,
+	owner text NOT NULL,
+	account text NOT NULL,
+	session text NOT NULL,
+	name text NOT NULL,
+	zone text NOT NULL,
+	payload bytea NOT NULL,
+	"cursor" bigint NOT NULL,
+	next_attempt timestamptz NOT NULL,
+	error text NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS mail_push_devices_owner_account ON mail_push_devices (owner, account);
+CREATE INDEX IF NOT EXISTS mail_push_devices_next_attempt ON mail_push_devices (next_attempt);
+CREATE TABLE IF NOT EXISTS mail_push_keys (
+	id text PRIMARY KEY,
+	public text NOT NULL,
+	private bytea NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mail_preferences (
+	id text PRIMARY KEY,
+	data jsonb NOT NULL
+);`
+
+// Keep transaction receipts permanently; only old recovered payloads expire.
+var sweepOutbox = []string{`UPDATE mail_outbox SET payload = NULL, payload_expires = NULL WHERE status IN ('sent', 'cancelled', 'restored') AND payload_expires <= now()`}
+
+const outboxCols = "id, owner, account, payload, send_at, created, status, retry_at, error, actor, payload_expires"
+
+// scanOutbox reads outboxCols from a pgx row.
+func scanOutbox(row interface{ Scan(...any) error }) (Outbox, error) {
+	var j Outbox
+	err := row.Scan(&j.ID, &j.Owner, &j.Account, &j.Payload, &j.SendAt, &j.Created, &j.Status, &j.RetryAt, &j.Error, &j.Actor, &j.PayloadExpires)
+	return j, err
+}
+
+// queryOutbox runs a SELECT of outboxCols.
+func (s *Service) queryOutbox(ctx context.Context, sql string, args ...any) ([]Outbox, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Outbox, error) { return scanOutbox(r) })
 }
 
 func validateSend(m Send) error {
@@ -111,15 +172,14 @@ func (s *Service) schedule(ctx context.Context, owner string, m Send, actor stri
 	state := s.owner(owner)
 	state.write.Lock()
 	defer state.write.Unlock()
-	var receipt Outbox
-	receiptErr := s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": key, "owner": owner}).Decode(&receipt)
+	receipt, receiptErr := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE id = $1 AND owner = $2", key, owner))
 	if receiptErr == nil {
 		if receipt.Account != address {
 			return Outbox{}, errors.New("transaction belongs to a previously linked account")
 		}
 		return receipt, nil
 	}
-	if !errors.Is(receiptErr, mongo.ErrNoDocuments) {
+	if !errors.Is(receiptErr, pg.ErrNoRows) {
 		return Outbox{}, receiptErr
 	}
 	if _, err := s.SenderIdentity(ctx, owner, m.From); err != nil {
@@ -149,12 +209,11 @@ func (s *Service) schedule(ctx context.Context, owner string, m Send, actor stri
 		return Outbox{}, errors.New("encoded message exceeds storage limit")
 	}
 	job := Outbox{ID: key, Owner: owner, Account: address, Payload: s.seal(raw), SendAt: m.SendAt, Created: time.Now(), Status: "pending", Actor: actor}
-	_, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": key, "owner": owner}, bson.M{"$setOnInsert": job}, options.UpdateOne().SetUpsert(true))
-	if err != nil && !mongo.IsDuplicateKeyError(err) {
+	_, err = s.pool.Exec(ctx, "INSERT INTO mail_outbox (id, owner, account, payload, send_at, created, status, actor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING", job.ID, job.Owner, job.Account, job.Payload, job.SendAt, job.Created, job.Status, job.Actor)
+	if err != nil {
 		return Outbox{}, fmt.Errorf("schedule send: %w", err)
 	}
-	var stored Outbox
-	err = s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": key, "owner": owner}).Decode(&stored)
+	stored, err := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE id = $1 AND owner = $2", key, owner))
 	if err == nil && stored.Account != address {
 		return Outbox{}, errors.New("transaction belongs to a previously linked account")
 	}
@@ -165,13 +224,7 @@ func (s *Service) Outbox(ctx context.Context, owner string) ([]Outbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Collection("mail_outbox").Find(ctx, bson.M{"owner": owner, "account": account, "status": bson.M{"$nin": []string{"sent", "cancelled", "restored"}}}, options.Find().SetSort(bson.D{{Key: "created", Value: -1}}).SetLimit(100))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	jobs := []Outbox{}
-	err = rows.All(ctx, &jobs)
+	jobs, err := s.queryOutbox(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE owner = $1 AND account = $2 AND status NOT IN ('sent', 'cancelled', 'restored') ORDER BY created DESC LIMIT 100", owner, account)
 	if err == nil {
 		for i := range jobs {
 			raw, openErr := s.open(jobs[i].Payload)
@@ -193,8 +246,8 @@ func (s *Service) OutboxMessage(ctx context.Context, owner, id string) (Send, er
 	if err != nil {
 		return Send{}, err
 	}
-	var job Outbox
-	if err := s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": id, "owner": owner, "account": account}).Decode(&job); err != nil {
+	job, err := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE id = $1 AND owner = $2 AND account = $3", id, owner, account))
+	if err != nil {
 		return Send{}, err
 	}
 	raw, err := s.open(job.Payload)
@@ -210,20 +263,19 @@ func (s *Service) CancelSend(ctx context.Context, owner, id string) error {
 	if err != nil {
 		return err
 	}
-	result, err := s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": id, "owner": owner, "account": account, "status": "pending"}, bson.M{"$set": bson.M{"status": "cancelled", "payload_expires": time.Now().Add(14 * 24 * time.Hour)}})
+	result, err := s.pool.Exec(ctx, "UPDATE mail_outbox SET status = 'cancelled', payload_expires = $4 WHERE id = $1 AND owner = $2 AND account = $3 AND status = 'pending'", id, owner, account, time.Now().Add(14*24*time.Hour))
 	if err != nil {
 		return err
 	}
-	if result.MatchedCount == 0 {
+	if result.RowsAffected() == 0 {
 		return errors.New("send already started or is no longer pending")
 	}
 	return nil
 }
 func (s *Service) deliverNext(ctx context.Context) error {
-	var job Outbox
-	filter := bson.M{"status": "pending", "send_at": bson.M{"$lte": time.Now()}, "$or": []bson.M{{"retry_at": bson.M{"$exists": false}}, {"retry_at": bson.M{"$lte": time.Now()}}}}
-	err := s.db.Collection("mail_outbox").FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "send_at", Value: 1}})).Decode(&job)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	const due = "status = 'pending' AND send_at <= now() AND retry_at <= now()"
+	job, err := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE "+due+" ORDER BY send_at LIMIT 1"))
+	if errors.Is(err, pg.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -235,8 +287,7 @@ func (s *Service) deliverNext(ctx context.Context) error {
 	}
 	defer release()
 	ctx = work
-	filter["_id"] = job.ID
-	if err = s.db.Collection("mail_outbox").FindOneAndUpdate(ctx, filter, bson.M{"$set": bson.M{"status": "sending"}}).Decode(&job); errors.Is(err, mongo.ErrNoDocuments) {
+	if job, err = scanOutbox(s.pool.QueryRow(ctx, "UPDATE mail_outbox SET status = 'sending' WHERE id = $1 AND "+due+" RETURNING "+outboxCols, job.ID)); errors.Is(err, pg.ErrNoRows) {
 		return nil
 	} else if err != nil {
 		return err
@@ -256,16 +307,16 @@ func (s *Service) deliverNext(ctx context.Context) error {
 	}
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	fields := bson.M{"status": status, "error": problem}
+	var retryAt, expires *time.Time
 	if status == "pending" {
-		fields["retry_at"] = time.Now().Add(10 * time.Second)
+		t := time.Now().Add(10 * time.Second)
+		retryAt = &t
 	}
-	update := bson.M{"$set": fields}
 	if status == "sent" {
-		update["$unset"] = bson.M{"payload": ""}
-		fields["payload_expires"] = time.Now().Add(14 * 24 * time.Hour)
+		t := time.Now().Add(14 * 24 * time.Hour)
+		expires = &t
 	}
-	_, updateErr := s.db.Collection("mail_outbox").UpdateOne(finishCtx, bson.M{"_id": job.ID, "owner": job.Owner}, update)
+	_, updateErr := s.pool.Exec(finishCtx, "UPDATE mail_outbox SET status = $3, error = $4, retry_at = COALESCE($5, retry_at), payload_expires = COALESCE($6, payload_expires), payload = CASE WHEN $3 = 'sent' THEN NULL ELSE payload END WHERE id = $1 AND owner = $2", job.ID, job.Owner, status, problem, retryAt, expires)
 	if updateErr != nil {
 		return updateErr
 	}
@@ -287,7 +338,7 @@ func (s *Service) deliver(ctx context.Context, job Outbox) error {
 		return errors.Join(ErrRenamePending, err)
 	}
 	// Reload after acquiring the command slot: rename recovery may have rewritten the payload.
-	if err := s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": job.ID, "owner": job.Owner, "account": job.Account}).Decode(&job); err != nil {
+	if job, err = scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE id = $1 AND owner = $2 AND account = $3", job.ID, job.Owner, job.Account)); err != nil {
 		return err
 	}
 	raw, err := s.open(job.Payload)
@@ -367,9 +418,9 @@ func (s *Service) RestoreUncertain(ctx context.Context, owner, id string) (Send,
 	state := s.owner(owner)
 	state.write.Lock()
 	defer state.write.Unlock()
-	filter := bson.M{"_id": id, "owner": owner, "account": account, "status": bson.M{"$in": []string{"uncertain", "restored"}}}
-	var job Outbox
-	if err = s.db.Collection("mail_outbox").FindOne(ctx, filter).Decode(&job); err != nil {
+	const where = "WHERE id = $1 AND owner = $2 AND account = $3 AND status IN ('uncertain', 'restored')"
+	job, err := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox "+where, id, owner, account))
+	if err != nil {
 		return Send{}, err
 	}
 	raw, err := s.open(job.Payload)
@@ -380,7 +431,7 @@ func (s *Service) RestoreUncertain(ctx context.Context, owner, id string) (Send,
 	if err = json.Unmarshal(raw, &message); err != nil {
 		return Send{}, err
 	}
-	if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, filter, bson.M{"$set": bson.M{"status": "restored", "payload_expires": time.Now().Add(14 * 24 * time.Hour)}}); err != nil {
+	if _, err = s.pool.Exec(ctx, "UPDATE mail_outbox SET status = 'restored', payload_expires = $4 "+where, id, owner, account, time.Now().Add(14*24*time.Hour)); err != nil {
 		return Send{}, err
 	}
 	message.TransactionID = ""
@@ -388,7 +439,6 @@ func (s *Service) RestoreUncertain(ctx context.Context, owner, id string) (Send,
 	return message, nil
 }
 func (s *Service) cleanOutbox(ctx context.Context) error {
-	// Keep transaction receipts permanently; only old recovered payloads expire.
-	_, err := s.db.Collection("mail_outbox").UpdateMany(ctx, bson.M{"status": bson.M{"$in": []string{"sent", "cancelled", "restored"}}, "payload_expires": bson.M{"$lte": time.Now()}}, bson.M{"$unset": bson.M{"payload": "", "payload_expires": ""}})
+	_, err := s.pool.Exec(ctx, sweepOutbox[0])
 	return err
 }

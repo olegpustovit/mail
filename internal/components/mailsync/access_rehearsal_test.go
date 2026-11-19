@@ -15,10 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 type idleAccessWire struct{ *syncFake }
@@ -81,7 +80,11 @@ func TestAccessActiveWorkRehearsal(t *testing.T) {
 	s.wg.Wait()
 	s.ctx, s.cancel = context.WithCancel(t.Context())
 	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	a, err := auth.New(t.Context(), auth.Config{BaseURL: "https://mail.example.test", MongoURI: os.Getenv("MAIL_TEST_MONGODB_URI"), Database: s.db.Name(), EncryptionKey: key})
+	var schema string
+	if err := s.pool.QueryRow(t.Context(), "SELECT current_schema()").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	a, err := auth.New(t.Context(), auth.Config{BaseURL: "https://mail.example.test", PostgresURI: os.Getenv("MAIL_TEST_POSTGRES_URI"), Schema: schema, EncryptionKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +192,7 @@ func TestAccessActiveWorkRehearsal(t *testing.T) {
 		}
 		payload, _ := json.Marshal(Send{To: []string{"eval-target@example.test"}, Subject: "eval interrupted send", Body: "owned fixture"})
 		id := "eval-" + phase.name
-		if _, err = s.db.Collection("mail_outbox").InsertOne(t.Context(), bson.M{"_id": id, "owner": owner, "account": "eval@icloud.com", "status": "pending", "send_at": time.Now().Add(-time.Minute), "payload": s.seal(payload)}); err != nil {
+		if _, err = s.pool.Exec(t.Context(), `INSERT INTO mail_outbox (id, owner, account, status, send_at, created, payload) VALUES ($1, $2, 'eval@icloud.com', 'pending', now() - interval '1 minute', now(), $3)`, id, owner, s.seal(payload)); err != nil {
 			t.Fatal(err)
 		}
 		delivered := make(chan error, 1)
@@ -230,8 +233,8 @@ func TestAccessActiveWorkRehearsal(t *testing.T) {
 		releaseCommand()
 		releaseWatch()
 		releaseIdle()
-		var result Outbox
-		if err = s.db.Collection("mail_outbox").FindOne(t.Context(), bson.M{"_id": id}).Decode(&result); err != nil || result.Status != "uncertain" {
+		var status string
+		if err = s.pool.QueryRow(t.Context(), `SELECT status FROM mail_outbox WHERE id = $1`, id).Scan(&status); err != nil || status != "uncertain" {
 			t.Fatal("ambiguous SMTP was not retained for review", err)
 		}
 		// New work must fail immediately even with the original unexpired token.

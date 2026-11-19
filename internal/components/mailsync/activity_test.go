@@ -2,7 +2,7 @@ package mailsync
 
 import (
 	"context"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 	"testing"
 )
 

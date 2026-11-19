@@ -3,11 +3,10 @@ package authhttp
 import (
 	"context"
 	"encoding/json"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/auth"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -41,12 +40,8 @@ func TestUnauthorizedAndOrigin(t *testing.T) {
 }
 
 func TestAccountPersistencePrecedesSyncInvalidation(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
 	ctx := context.Background()
-	s := testService(t, uri)
+	s := testService(t)
 	var err error
 	owner := "link-order-" + strings.ToLower(auth.Random()) + "@olegpustovit.com"
 	session := auth.Random()
@@ -93,12 +88,8 @@ func TestAccountPersistencePrecedesSyncInvalidation(t *testing.T) {
 	}
 }
 func TestOAuthPKCEIntegration(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
 	ctx := context.Background()
-	s := testService(t, uri)
+	s := testService(t)
 	var e error
 	h := New(s)
 	mux := http.NewServeMux()

@@ -9,8 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 var ErrInvalidSearchCursor = errors.New("invalid search cursor")
@@ -111,22 +110,12 @@ func (s *Service) RemoteSearch(ctx context.Context, owner, account, query string
 		}
 		stored := map[string]Metadata{}
 		if len(keys) > 0 {
-			rows, err := s.db.Collection("mail_messages").Find(ctx, bson.M{"owner": owner, "account": account, "_id": bson.M{"$in": keys}})
+			rows, err := s.loadMessages(ctx, `WHERE owner = $1 AND account = $2 AND key = ANY($3)`, owner, account, keys)
 			if err != nil {
 				return result, err
 			}
-			for rows.Next(ctx) {
-				var item Metadata
-				if err = rows.Decode(&item); err != nil {
-					_ = rows.Close(ctx)
-					return result, err
-				}
+			for _, item := range rows {
 				stored[item.Key] = item
-			}
-			err = rows.Err()
-			_ = rows.Close(ctx)
-			if err != nil {
-				return result, err
 			}
 		}
 		for i, mail := range mails {

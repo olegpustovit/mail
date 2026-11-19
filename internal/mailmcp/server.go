@@ -9,7 +9,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type field struct {

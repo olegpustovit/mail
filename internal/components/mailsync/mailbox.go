@@ -5,14 +5,13 @@ import (
 	"errors"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/pg"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 type Mailbox struct {
@@ -73,41 +72,89 @@ func (m *Mailbox) folder(ctx context.Context, name string) (Folder, error) {
 	if err := m.s.WaitReady(ctx, m.owner); err != nil {
 		return Folder{}, err
 	}
-	var folder Folder
-	err := m.s.db.Collection("mail_folders").FindOne(ctx, bson.M{"owner": m.owner, "account": m.account, "info.name": name}).Decode(&folder)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	folder, err := m.s.folderByName(ctx, m.owner, m.account, name)
+	if errors.Is(err, pg.ErrNoRows) {
 		if err = m.s.Refresh(ctx, m.owner, "imap", "", name); err != nil {
 			return folder, err
 		}
-		err = m.s.db.Collection("mail_folders").FindOne(ctx, bson.M{"owner": m.owner, "account": m.account, "info.name": name}).Decode(&folder)
+		folder, err = m.s.folderByName(ctx, m.owner, m.account, name)
 	}
 	return folder, err
 }
-func mailFilter(folder, query string, filters imap.EmailFilters) bson.M {
-	filter := bson.M{}
+func (s *Service) folderByName(ctx context.Context, owner, account, name string) (Folder, error) {
+	var d folderDoc
+	if err := s.pool.QueryRow(ctx, `SELECT data FROM mail_folders WHERE owner = $1 AND account = $2 AND name = $3 LIMIT 1`, owner, account, name).Scan(&d); err != nil {
+		return Folder{}, err
+	}
+	return *d.folder(), nil
+}
+
+// filter accumulates SQL conditions; "?" in a condition becomes the next $n argument.
+type filter struct {
+	conds []string
+	args  []any
+}
+
+func (f *filter) add(cond string, args ...any) {
+	for _, a := range args {
+		f.args = append(f.args, a)
+		cond = strings.Replace(cond, "?", "$"+strconv.Itoa(len(f.args)), 1)
+	}
+	f.conds = append(f.conds, cond)
+}
+func (f *filter) where() string {
+	if len(f.conds) == 0 {
+		return "TRUE"
+	}
+	return strings.Join(f.conds, " AND ")
+}
+
+// page appends ORDER BY/OFFSET/LIMIT and returns the row tail for loadMessages.
+func (f *filter) page(offset, limit int) string {
+	q := "WHERE " + f.where() + " ORDER BY date DESC, key OFFSET " + strconv.Itoa(max(offset, 0))
+	if limit > 0 {
+		q += " LIMIT " + strconv.Itoa(limit)
+	}
+	return q
+}
+func (s *Service) countMessages(ctx context.Context, f *filter) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_messages WHERE "+f.where(), f.args...).Scan(&n)
+	return n, err
+}
+
+// Text fields live in the jsonb payload; recipients are arrays. Patterns are quoted regexes matched case-insensitively.
+const (
+	fieldSubject = "(data->>'subject')"
+	fieldFrom    = "(data->>'from')"
+	fieldSnippet = "(data->>'snippet')"
+	fieldTo      = "EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(data->'to') = 'array' THEN data->'to' ELSE '[]'::jsonb END) r WHERE r ~* ?)"
+)
+
+func (f *filter) anyText(pattern string) {
+	f.add("("+fieldSubject+" ~* ? OR "+fieldFrom+" ~* ? OR "+fieldSnippet+" ~* ? OR "+fieldTo+")", pattern, pattern, pattern, pattern)
+}
+
+func mailFilter(folder, query string, filters imap.EmailFilters) *filter {
+	f := &filter{}
 	if folder != "" && folder != "*" {
-		filter["email.folder"] = folder
+		f.add("folder = ?", folder)
 	}
 	if filters.UnreadOnly {
-		filter["email.unread"] = true
+		f.add("(data->>'unread')::boolean")
 	}
-	date := bson.M{}
 	if filters.Since != nil {
-		date["$gte"] = *filters.Since
+		f.add("date >= ?", *filters.Since)
 	} else if filters.LastDays > 0 {
-		date["$gte"] = time.Now().AddDate(0, 0, -filters.LastDays)
+		f.add("date >= ?", time.Now().AddDate(0, 0, -filters.LastDays))
 	}
 	if filters.Before != nil {
-		date["$lt"] = *filters.Before
-	}
-	if len(date) > 0 {
-		filter["email.date"] = date
+		f.add("date < ?", *filters.Before)
 	}
 	if query != "" {
-		pattern := bson.M{"$regex": regexp.QuoteMeta(query), "$options": "i"}
-		filter["$or"] = []bson.M{{"email.subject": pattern}, {"email.from": pattern}, {"email.snippet": pattern}, {"email.to": pattern}}
+		f.anyText(regexp.QuoteMeta(query))
 	}
-	return filter
+	return f
 }
 func (m *Mailbox) SearchEmails(ctx context.Context, folder, query string, filters imap.EmailFilters) ([]imap.Email, int, error) {
 	f, err := m.folder(ctx, folder)
@@ -130,31 +177,21 @@ func (m *Mailbox) SearchEmails(ctx context.Context, folder, query string, filter
 		}
 		return mail, total, err
 	}
-	filter := mailFilter(folder, query, filters)
-	filter["owner"] = m.owner
-	filter["account"] = m.account
-	count, err := m.s.db.Collection("mail_messages").CountDocuments(ctx, filter)
+	w := mailFilter(folder, query, filters)
+	w.add("owner = ? AND account = ?", m.owner, m.account)
+	count, err := m.s.countMessages(ctx, w)
 	if err != nil {
 		return nil, 0, err
 	}
-	find := options.Find().SetSort(bson.D{{Key: "email.date", Value: -1}, {Key: "_id", Value: 1}}).SetSkip(int64(max(filters.Offset, 0)))
-	if filters.Limit > 0 {
-		find.SetLimit(int64(filters.Limit))
-	}
-	rows, err := m.s.db.Collection("mail_messages").Find(ctx, filter, find)
+	stored, err := m.s.loadMessages(ctx, w.page(filters.Offset, filters.Limit), w.args...)
 	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	var stored []Metadata
-	if err = rows.All(ctx, &stored); err != nil {
 		return nil, 0, err
 	}
 	mail := make([]imap.Email, len(stored))
 	for i, row := range stored {
 		mail[i] = row.Email
 	}
-	return mail, int(count), nil
+	return mail, count, nil
 }
 func (m *Mailbox) CountEmails(ctx context.Context, folder string, filters imap.EmailFilters) (int, error) {
 	f, err := m.folder(ctx, folder)
@@ -175,29 +212,29 @@ func (m *Mailbox) CountEmails(ctx context.Context, folder string, filters imap.E
 		defer release()
 		return connection.Mail.CountEmails(ctx, folder, filters)
 	}
-	filter := mailFilter(folder, "", filters)
-	filter["owner"] = m.owner
-	filter["account"] = m.account
-	count, err := m.s.db.Collection("mail_messages").CountDocuments(ctx, filter)
-	return int(count), err
+	w := mailFilter(folder, "", filters)
+	w.add("owner = ? AND account = ?", m.owner, m.account)
+	return m.s.countMessages(ctx, w)
 }
 
 // CachedEmail reads only the requested immutable mailbox generation; cache misses still need live validation.
 func (m *Mailbox) CachedEmail(ctx context.Context, folder, id string, validity uint32) (*imap.Email, error) {
-	var metadata Metadata
-	err := m.s.db.Collection("mail_messages").FindOne(ctx, bson.M{"_id": messageKey(m.owner, m.account, folder, validity, id), "owner": m.owner, "account": m.account, "body_cached": true}).Decode(&metadata)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, nil
-	}
-	if err != nil {
+	rows, err := m.s.loadMessages(ctx, `WHERE key = $1 AND owner = $2 AND account = $3 AND body_cached`, messageKey(m.owner, m.account, folder, validity, id), m.owner, m.account)
+	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	return &metadata.Email, nil
+	return &rows[0].Email, nil
 }
 
 func (m *Mailbox) GetEmail(ctx context.Context, folder, id string) (*imap.Email, error) {
 	var metadata Metadata
-	metadataErr := m.s.db.Collection("mail_messages").FindOne(ctx, bson.M{"owner": m.owner, "account": m.account, "email.folder": folder, "email.id": id}).Decode(&metadata)
+	rows, metadataErr := m.s.loadMessages(ctx, `WHERE owner = $1 AND account = $2 AND folder = $3 AND uid = $4 ORDER BY uidvalidity DESC LIMIT 1`, m.owner, m.account, folder, id)
+	if metadataErr == nil && len(rows) == 0 {
+		metadataErr = pg.ErrNoRows
+	}
+	if metadataErr == nil {
+		metadata = rows[0]
+	}
 	if metadataErr == nil && metadata.BodyCached {
 		cached := metadata.Email
 		return &cached, nil
@@ -222,7 +259,7 @@ func (m *Mailbox) GetEmail(ctx context.Context, folder, id string) (*imap.Email,
 		email.UnsubscribePost = metadata.UnsubscribePost
 	}
 	if email.Size <= 8<<20 {
-		_, _ = m.s.db.Collection("mail_messages").UpdateOne(ctx, bson.M{"_id": messageKey(m.owner, m.account, folder, email.UIDValidity, id), "owner": m.owner, "account": m.account}, bson.M{"$set": bson.M{"body_cached": true, "email.bodyplain": email.BodyPlain, "email.bodyhtml": email.BodyHTML, "email.inlineimages": email.InlineImages}})
+		_ = m.s.cacheBody(ctx, m.owner, m.account, messageKey(m.owner, m.account, folder, email.UIDValidity, id), email)
 	}
 	return email, nil
 }
@@ -354,54 +391,45 @@ func (s *Service) MirrorSearch(ctx context.Context, owner, account, folder, quer
 	if err := s.WaitReady(ctx, owner); err != nil {
 		return nil, 0, err
 	}
-	filter := mailFilter(folder, "", imap.EmailFilters{})
+	f := mailFilter(folder, "", imap.EmailFilters{})
 	if folder == "flagged" {
-		delete(filter, "email.folder")
-		filter["email.flagcolor"] = bson.M{"$nin": []any{"", nil}}
+		f = &filter{}
+		f.add("COALESCE(data->>'flagColor', '') <> ''")
 	}
 	if folder == "vip" {
-		delete(filter, "email.folder")
+		f = &filter{}
 		prefs, err := s.Preferences(ctx, owner)
 		if err != nil {
 			return nil, 0, err
 		}
-		senders := make([]bson.M, 0, len(prefs.VIP))
-		for _, sender := range prefs.VIP {
-			senders = append(senders, bson.M{"email.from": bson.M{"$regex": "(?i)(^|<)" + regexp.QuoteMeta(sender) + ">?$"}})
-		}
-		if len(senders) == 0 {
+		if len(prefs.VIP) == 0 {
 			return []Metadata{}, 0, nil
 		}
-		filter["$or"] = senders
+		senders := make([]string, len(prefs.VIP))
+		args := make([]any, len(prefs.VIP))
+		for i, sender := range prefs.VIP {
+			senders[i] = fieldFrom + " ~* ?"
+			args[i] = "(^|<)" + regexp.QuoteMeta(sender) + ">?$"
+		}
+		f.add("("+strings.Join(senders, " OR ")+")", args...)
 	}
 	if query != "" {
-		conditions, err := searchConditions(query)
-		if err != nil {
+		if err := searchConditions(f, query); err != nil {
 			return nil, 0, err
 		}
-		filter["$and"] = conditions
 	}
-	filter["owner"] = owner
-	filter["account"] = account
-	count, err := s.db.Collection("mail_messages").CountDocuments(ctx, filter)
+	f.add("owner = ? AND account = ?", owner, account)
+	count, err := s.countMessages(ctx, f)
 	if err != nil {
 		return nil, 0, err
 	}
-	find := options.Find().SetSort(bson.D{{Key: "email.date", Value: -1}, {Key: "_id", Value: 1}}).SetSkip(int64(max(offset, 0))).SetLimit(int64(min(max(limit, 1), 2000)))
-	rows, err := s.db.Collection("mail_messages").Find(ctx, filter, find)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	mail := []Metadata{}
-	err = rows.All(ctx, &mail)
-	return mail, count, err
+	mail, err := s.loadMessages(ctx, f.page(offset, min(max(limit, 1), 2000)), f.args...)
+	return mail, int64(count), err
 }
 
 var searchToken = regexp.MustCompile(`(?:[^\s"]+|"[^"]*")+`)
 
-func searchConditions(query string) ([]bson.M, error) {
-	conditions := []bson.M{}
+func searchConditions(f *filter, query string) error {
 	for _, token := range searchToken.FindAllString(query, -1) {
 		key, value, hasKey := strings.Cut(token, ":")
 		if !hasKey {
@@ -409,41 +437,45 @@ func searchConditions(query string) ([]bson.M, error) {
 			key = ""
 		}
 		value = strings.Trim(value, `"`)
-		pattern := bson.M{"$regex": regexp.QuoteMeta(value), "$options": "i"}
+		pattern := regexp.QuoteMeta(value)
 		switch strings.ToLower(key) {
-		case "from", "to", "subject":
-			conditions = append(conditions, bson.M{"email." + strings.ToLower(key): pattern})
+		case "from":
+			f.add(fieldFrom+" ~* ?", pattern)
+		case "subject":
+			f.add(fieldSubject+" ~* ?", pattern)
+		case "to":
+			f.add(fieldTo, pattern)
 		case "in":
-			conditions = append(conditions, bson.M{"email.folder": pattern})
+			f.add("folder ~* ?", pattern)
 		case "is":
 			switch value {
 			case "unread":
-				conditions = append(conditions, bson.M{"email.unread": true})
+				f.add("(data->>'unread')::boolean")
 			case "read":
-				conditions = append(conditions, bson.M{"email.unread": false})
+				f.add("NOT (data->>'unread')::boolean")
 			case "flagged":
-				conditions = append(conditions, bson.M{"email.flagcolor": bson.M{"$nin": []any{"", nil}}})
+				f.add("COALESCE(data->>'flagColor', '') <> ''")
 			default:
-				return nil, errors.New("unknown is: search filter")
+				return errors.New("unknown is: search filter")
 			}
 		case "has":
 			if value != "attachment" {
-				return nil, errors.New("unknown has: search filter")
+				return errors.New("unknown has: search filter")
 			}
-			conditions = append(conditions, bson.M{"email.attachments.0": bson.M{"$exists": true}})
+			f.add("jsonb_typeof(data->'attachments') = 'array' AND data->'attachments' <> '[]'::jsonb")
 		case "after", "before":
 			date, err := time.Parse("2006-01-02", value)
 			if err != nil {
-				return nil, errors.New("search dates must use YYYY-MM-DD")
+				return errors.New("search dates must use YYYY-MM-DD")
 			}
-			op := "$gte"
 			if key == "before" {
-				op = "$lt"
+				f.add("date < ?", date)
+			} else {
+				f.add("date >= ?", date)
 			}
-			conditions = append(conditions, bson.M{"email.date": bson.M{op: date}})
 		default:
-			conditions = append(conditions, bson.M{"$or": []bson.M{{"email.subject": pattern}, {"email.from": pattern}, {"email.to": pattern}, {"email.snippet": pattern}}})
+			f.anyText(pattern)
 		}
 	}
-	return conditions, nil
+	return nil
 }

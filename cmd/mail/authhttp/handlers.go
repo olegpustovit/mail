@@ -5,7 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
-	icloudimap "github.com/olegpustovit/mcp-icloud-email/imap"
+	icloudimap "github.com/olegpustovit/mail/imap"
 	"html/template"
 	"io"
 	"net/http"
@@ -17,8 +17,8 @@ import (
 
 	idclient "github.com/olegpustovit/identity/idclient-go"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/internal/httpcancel"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/httpcancel"
 )
 
 type Handler struct {

@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
+	"github.com/olegpustovit/mail/smtp"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type imapStub struct{ tools.EmailService }

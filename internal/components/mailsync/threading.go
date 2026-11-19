@@ -6,18 +6,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/jackc/pgx/v5"
+	"github.com/olegpustovit/mail/imap"
 )
 
 type threadNode struct {
-	Key        string `bson:"_id"`
-	Owner      string `bson:"owner"`
-	Account    string `bson:"account"`
-	Identifier string `bson:"identifier"`
-	Thread     string `bson:"thread"`
+	Key        string
+	Owner      string
+	Account    string
+	Identifier string
+	Thread     string
 }
 
 type threadUnion map[string]string
@@ -94,30 +92,42 @@ func (s *Service) prepareBatch(ctx context.Context, owner, account string, email
 		identifiers = append(identifiers, id)
 	}
 	for start := 0; start < len(nodeKeys); start += 5000 {
-		rows, err := s.db.Collection("mail_thread_nodes").Find(ctx, bson.M{"owner": owner, "account": account, "_id": bson.M{"$in": nodeKeys[start:min(start+5000, len(nodeKeys))]}})
+		rows, err := s.pool.Query(ctx, `SELECT id, thread FROM mail_thread_nodes WHERE owner = $1 AND account = $2 AND id = ANY($3)`, owner, account, nodeKeys[start:min(start+5000, len(nodeKeys))])
 		if err != nil {
 			return nil, nil, err
 		}
-		var nodes []threadNode
-		err = rows.All(ctx, &nodes)
-		_ = rows.Close(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, node := range nodes {
+		for rows.Next() {
+			var node threadNode
+			if err = rows.Scan(&node.Key, &node.Thread); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
 			union.join(node.Key, node.Thread)
 			oldRoots[node.Thread] = true
 		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	// Bridge metadata also repairs an interrupted import that already updated nodes.
-	filter := bson.M{"owner": owner, "account": account, "$or": []bson.M{{"_id": bson.M{"$in": keys}}, {"email.messageid": bson.M{"$in": identifiers}}, {"subject_key": bson.M{"$in": subjects}, "email.date": bson.M{"$gte": earliest.AddDate(0, 0, -30), "$lte": latest.AddDate(0, 0, 30)}}}}
-	rows, err := s.db.Collection("mail_messages").Find(ctx, filter, options.Find().SetProjection(bson.M{"email.threadid": 1, "email.messageid": 1, "email.date": 1, "subject_key": 1}))
+	rows, err := s.pool.Query(ctx, `SELECT thread_id, message_id, date, subject_key FROM mail_messages WHERE owner = $1 AND account = $2 AND (key = ANY($3) OR message_id = ANY($4) OR (subject_key = ANY($5) AND date >= $6 AND date <= $7))`,
+		owner, account, keys, identifiers, subjects, earliest.AddDate(0, 0, -30), latest.AddDate(0, 0, 30))
 	if err != nil {
 		return nil, nil, err
 	}
 	var peers []Metadata
-	err = rows.All(ctx, &peers)
-	_ = rows.Close(ctx)
+	for rows.Next() {
+		var peer Metadata
+		if err = rows.Scan(&peer.ThreadID, &peer.MessageID, &peer.Date, &peer.SubjectKey); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		peers = append(peers, peer)
+	}
+	err = rows.Err()
+	rows.Close()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -143,7 +153,7 @@ func (s *Service) prepareBatch(ctx context.Context, owner, account string, email
 		}
 		bySubject[subject] = append(bySubject[subject], Metadata{Email: imap.Email{ThreadID: anchors[i], Date: email.Date}})
 	}
-	models := []mongo.WriteModel{}
+	batch := &pgx.Batch{}
 	mergedRoots := []string{}
 	rootTargets := map[string]string{}
 	for root := range oldRoots {
@@ -151,21 +161,19 @@ func (s *Service) prepareBatch(ctx context.Context, owner, account string, email
 		if target != root {
 			mergedRoots = append(mergedRoots, root)
 			rootTargets[root] = target
-			models = append(models, mongo.NewUpdateManyModel().SetFilter(bson.M{"owner": owner, "account": account, "thread": root}).SetUpdate(bson.M{"$set": bson.M{"thread": target}}))
+			batch.Queue(`UPDATE mail_thread_nodes SET thread = $4 WHERE owner = $1 AND account = $2 AND thread = $3`, owner, account, root, target)
 		}
 	}
 	for id, key := range ids {
 		node := threadNode{Key: key, Owner: owner, Account: account, Identifier: id, Thread: union.root(key)}
-		models = append(models, mongo.NewReplaceOneModel().SetFilter(bson.M{"_id": key, "owner": owner, "account": account}).SetReplacement(node).SetUpsert(true))
+		batch.Queue(`INSERT INTO mail_thread_nodes (id, owner, account, identifier, thread) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET owner = EXCLUDED.owner, account = EXCLUDED.account, identifier = EXCLUDED.identifier, thread = EXCLUDED.thread`, node.Key, node.Owner, node.Account, node.Identifier, node.Thread)
 	}
-	if len(models) > 0 {
-		if _, err = s.db.Collection("mail_thread_nodes").BulkWrite(ctx, models); err != nil {
-			return nil, nil, err
-		}
+	if err = s.sendBatch(ctx, batch); err != nil {
+		return nil, nil, err
 	}
 	merged := []Change{}
 	if len(mergedRoots) > 0 {
-		mail, err := s.metadata(ctx, owner, account, bson.M{"email.threadid": bson.M{"$in": mergedRoots}}, 0)
+		mail, err := s.metadata(ctx, owner, account, "thread_id = ANY($3)", []any{mergedRoots}, "", 0)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -185,5 +193,5 @@ func (s *Service) prepareBatch(ctx context.Context, owner, account string, email
 }
 
 func (s *Service) Thread(ctx context.Context, owner, account, thread string) ([]Metadata, error) {
-	return s.metadata(ctx, owner, account, bson.M{"email.threadid": thread}, 0)
+	return s.metadata(ctx, owner, account, "thread_id = $3", []any{thread}, "", 0)
 }

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"github.com/microcosm-cc/bluemonday"
-	"github.com/olegpustovit/mcp-icloud-email/internal/publichttp"
+	"github.com/olegpustovit/mail/internal/publichttp"
 	"io"
 	"net/http"
 	"net/http/httptest"

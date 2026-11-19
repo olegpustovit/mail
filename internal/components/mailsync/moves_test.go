@@ -15,9 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type moveWire struct {
@@ -250,11 +249,16 @@ func connectMoveFake(s *Service, f *moveWire) {
 }
 func readMove(t *testing.T, s *Service, owner, transaction string) Move {
 	t.Helper()
-	var job Move
-	if err := s.db.Collection("mail_moves").FindOne(context.Background(), bson.M{"owner": owner, "transaction": transaction}).Decode(&job); err != nil {
+	job, err := s.loadMove(context.Background(), "owner=$1 AND transaction=$2", owner, transaction)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return job
+}
+
+// reopenService starts a second Service on the same Postgres schema, as after a restart.
+func reopenService(ctx context.Context, s *Service) (*Service, error) {
+	return newService(ctx, os.Getenv("MAIL_TEST_POSTGRES_URI"), base64.StdEncoding.EncodeToString(make([]byte, 32)), s.credentials, s.pool.Config().ConnConfig.RuntimeParams["search_path"])
 }
 
 func TestSnoozeRestartRecoveryMoveUndoAndIsolation(t *testing.T) {
@@ -282,26 +286,25 @@ func TestSnoozeRestartRecoveryMoveUndoAndIsolation(t *testing.T) {
 	if job.State != "snoozed" || job.Current.Folder != "Snoozed" {
 		t.Fatalf("not snoozed: %+v", job)
 	}
-	var metadata Metadata
-	if err = s.db.Collection("mail_messages").FindOne(ctx, bson.M{"_id": messageKey(owner, box.account, "Snoozed", 7, job.Current.ID)}).Decode(&metadata); err != nil || !metadata.Snoozed || metadata.SnoozeUntil == nil {
+	found, err := s.metadata(ctx, owner, box.account, "key = $3", []any{messageKey(owner, box.account, "Snoozed", 7, job.Current.ID)}, "", 1)
+	if err != nil || len(found) != 1 || !found[0].Snoozed || found[0].SnoozeUntil == nil {
 		t.Fatal("snooze metadata missing", err)
 	}
 	if err = s.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := newService(ctx, os.Getenv("MAIL_TEST_MONGODB_URI"), base64.StdEncoding.EncodeToString(make([]byte, 32)), s.credentials, s.db.Name())
+	resumed, err := reopenService(ctx, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		resumed.cancel()
 		resumed.wg.Wait()
-		_ = resumed.db.Drop(context.Background())
 		_ = resumed.Close(context.Background())
 	})
 	connectMoveFake(resumed, f)
 	past := time.Now().Add(-time.Minute)
-	if _, err = resumed.db.Collection("mail_moves").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"until": past, "next_attempt": past}}); err != nil {
+	if _, err = resumed.pool.Exec(ctx, "UPDATE mail_moves SET until=$2, next_attempt=$2 WHERE id=$1", job.ID, past); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, func() bool { return readMove(t, resumed, owner, "snooze-one").State == "awake" })
@@ -365,13 +368,13 @@ func TestSnoozeRestartRecoveryMoveUndoAndIsolation(t *testing.T) {
 	}
 	stale := job.Current
 	stale.Validity = 99
-	if _, err = resumed.db.Collection("mail_moves").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"current": stale, "until": past, "next_attempt": past}}); err != nil {
+	if _, err = resumed.pool.Exec(ctx, "UPDATE mail_moves SET cur_folder=$2, cur_uid=$3, cur_validity=$4, until=$5, next_attempt=$5 WHERE id=$1", job.ID, stale.Folder, stale.ID, stale.Validity, past); err != nil {
 		t.Fatal(err)
 	}
 	if err = resumed.runMove(ctx); err == nil {
 		t.Fatal("wake ignored a changed mailbox identity")
 	}
-	if err = resumed.db.Collection("mail_messages").FindOne(ctx, bson.M{"owner": owner, "email.flags": job.Marker}).Decode(&metadata); err != nil || metadata.SnoozeError == "" {
+	if found, err = resumed.metadata(ctx, owner, box.account, "$3 = ANY(flags)", []any{job.Marker}, "", 1); err != nil || len(found) != 1 || found[0].SnoozeError == "" {
 		t.Fatal("background wake failure was not visible in the replica", err)
 	}
 	if err = box.Unsnooze(Transaction(ctx, "unsnooze"), job.Current); err != nil {

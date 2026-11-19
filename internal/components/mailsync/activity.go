@@ -6,18 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 func (s *Service) Activity(ctx context.Context, owner, account string) ([]Change, error) {
-	rows, err := s.db.Collection("mail_changelog").Find(ctx, bson.M{"owner": owner, "account": account, "committed": true, "actor": bson.M{"$regex": "^mcp:"}, "entity": bson.M{"$in": []string{"msg", "folder"}}}, options.Find().SetSort(bson.D{{Key: "seq", Value: -1}}).SetLimit(100))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	changes := []Change{}
-	err = rows.All(ctx, &changes)
+	changes, err := s.queryChanges(ctx, `WHERE owner = $1 AND account = $2 AND committed AND actor LIKE 'mcp:%' AND entity IN ('msg', 'folder') ORDER BY seq DESC LIMIT 100`, owner, account)
 	if err != nil {
 		return nil, err
 	}
@@ -35,10 +28,14 @@ func (s *Service) Activity(ctx context.Context, owner, account string) ([]Change
 	return result, nil
 }
 func (s *Service) UndoActivity(ctx context.Context, owner, account string, sequence int64) error {
-	var change Change
-	if err := s.db.Collection("mail_changelog").FindOne(ctx, bson.M{"owner": owner, "account": account, "seq": sequence, "committed": true, "actor": bson.M{"$regex": "^mcp:"}}).Decode(&change); err != nil {
+	changes, err := s.queryChanges(ctx, `WHERE owner = $1 AND account = $2 AND seq = $3 AND committed AND actor LIKE 'mcp:%'`, owner, account, sequence)
+	if err != nil {
 		return err
 	}
+	if len(changes) == 0 {
+		return pg.ErrNoRows
+	}
+	change := changes[0]
 	mailbox, err := s.Mailbox(ctx, owner, "web")
 	if err != nil {
 		return err
@@ -54,8 +51,8 @@ func (s *Service) UndoActivity(ctx context.Context, owner, account string, seque
 		return errors.New("this activity cannot be reversed")
 	}
 	return mailbox.change(ctx, []string{after.Folder}, func(ctx context.Context, c *Connection) error {
-		var current Metadata
-		if err := s.db.Collection("mail_messages").FindOne(ctx, bson.M{"_id": after.Key, "owner": owner, "account": account}).Decode(&current); err != nil {
+		current, err := s.messageByKey(ctx, owner, account, after.Key)
+		if err != nil {
 			return err
 		}
 		if current.Version != sequence {

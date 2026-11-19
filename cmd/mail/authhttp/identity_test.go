@@ -11,14 +11,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/auth"
 )
 
 // provider is a minimal Microapps ID that signs real RS256 tokens for a configurable verified identity.
@@ -91,10 +90,6 @@ func (p *provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func identityMux(t *testing.T, enforced ...bool) (*http.ServeMux, *auth.Service, *provider) {
 	t.Helper()
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +97,7 @@ func identityMux(t *testing.T, enforced ...bool) (*http.ServeMux, *auth.Service,
 	p := &provider{key: key, codes: map[string]url.Values{}, emailVerified: true}
 	server := httptest.NewServer(p)
 	t.Cleanup(server.Close)
-	s := testService(t, uri)
+	s := testService(t)
 	h := New(s)
 	cfg := auth.IdentityConfig{Issuer: server.URL, ClientID: "app_mail", CookieKey: [32]byte{7}}
 	if len(enforced) > 0 && enforced[0] {

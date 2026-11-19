@@ -4,37 +4,48 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/jackc/pgx/v5"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 type FolderRename struct {
-	From      string `bson:"from" json:"from"`
-	To        string `bson:"to" json:"to"`
-	Delimiter string `bson:"delimiter" json:"delimiter"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Delimiter string `json:"delimiter"`
 }
 type folderOperation struct {
-	ID                string `bson:"_id"`
-	Owner             string `bson:"owner"`
-	Account           string `bson:"account"`
-	Actor             string `bson:"actor"`
-	Transaction       string `bson:"transaction"`
-	FolderRename      `bson:",inline"`
-	Generations       map[string]uint32 `bson:"generations"`
-	Validity          uint32            `bson:"validity"`
-	State             string            `bson:"state"`
-	NextAttempt       time.Time         `bson:"next_attempt"`
-	Created           time.Time         `bson:"created"`
-	Expires           *time.Time        `bson:"expires,omitempty"`
-	ReferencesUpdated bool              `bson:"references_updated,omitempty"`
-	Error             string            `bson:"error,omitempty"`
+	ID          string
+	Owner       string
+	Account     string
+	Actor       string
+	Transaction string
+	FolderRename
+	Generations       map[string]uint32
+	Validity          uint32
+	State             string
+	NextAttempt       time.Time
+	Created           time.Time
+	Expires           *time.Time
+	ReferencesUpdated bool
+	Error             string
+}
+
+const opColumns = "id, owner, account, actor, transaction, from_name, to_name, delimiter, generations, validity, state, next_attempt, created, expires, references_updated, error"
+
+// fields lists pointers in opColumns order, for both Scan and query arguments.
+func (o *folderOperation) fields() []any {
+	return []any{&o.ID, &o.Owner, &o.Account, &o.Actor, &o.Transaction, &o.From, &o.To, &o.Delimiter, &o.Generations, &o.Validity, &o.State, &o.NextAttempt, &o.Created, &o.Expires, &o.ReferencesUpdated, &o.Error}
+}
+func (s *Service) loadOp(ctx context.Context, where string, args ...any) (folderOperation, error) {
+	var op folderOperation
+	err := s.pool.QueryRow(ctx, "SELECT "+opColumns+" FROM mail_folder_ops WHERE "+where+" LIMIT 1", args...).Scan(op.fields()...)
+	return op, err
 }
 
 var ErrRenamePending = errors.New("folder rename recovery is pending")
@@ -55,9 +66,8 @@ func (m *Mailbox) RenameFolder(ctx context.Context, from, to string) error {
 	}
 	return m.changeCommand(ctx, nil, true, func(ctx context.Context, c *Connection) error {
 		id := identity(m.owner, m.account, transaction)
-		var op folderOperation
-		err := m.s.db.Collection("mail_folder_ops").FindOne(ctx, bson.M{"_id": id, "owner": m.owner, "account": m.account}).Decode(&op)
-		if errors.Is(err, mongo.ErrNoDocuments) {
+		op, err := m.s.loadOp(ctx, "id=$1 AND owner=$2 AND account=$3", id, m.owner, m.account)
+		if errors.Is(err, pg.ErrNoRows) {
 			folders, err := m.s.Folders(ctx, m.owner, m.account)
 			if err != nil {
 				return err
@@ -100,7 +110,7 @@ func (m *Mailbox) RenameFolder(ctx context.Context, from, to string) error {
 					op.Generations[name] = generation
 				}
 			}
-			if _, err = m.s.db.Collection("mail_folder_ops").InsertOne(ctx, op); err != nil {
+			if _, err = m.s.pool.Exec(ctx, "INSERT INTO mail_folder_ops ("+opColumns+") VALUES ("+marks(1, 16)+")", op.fields()...); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -113,11 +123,11 @@ func (m *Mailbox) RenameFolder(ctx context.Context, from, to string) error {
 	})
 }
 func (s *Service) checkRenamePending(ctx context.Context, owner, account string) error {
-	n, err := s.db.Collection("mail_folder_ops").CountDocuments(ctx, bson.M{"owner": owner, "account": account, "state": "pending"})
-	if err != nil {
+	var pending bool
+	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM mail_folder_ops WHERE owner=$1 AND account=$2 AND state='pending')", owner, account).Scan(&pending); err != nil {
 		return err
 	}
-	if n > 0 {
+	if pending {
 		return ErrRenamePending
 	}
 	return nil
@@ -158,7 +168,7 @@ func (s *Service) applyRename(ctx context.Context, c *Connection, op folderOpera
 	state := s.owner(op.Owner)
 	state.write.Lock()
 	defer state.write.Unlock()
-	if _, err = s.db.Collection("mail_folder_ops").UpdateOne(ctx, bson.M{"_id": op.ID, "owner": op.Owner, "account": op.Account, "state": "pending"}, bson.M{"$set": bson.M{"references_updated": true}}); err != nil {
+	if _, err = s.pool.Exec(ctx, "UPDATE mail_folder_ops SET references_updated=true WHERE id=$1 AND owner=$2 AND account=$3 AND state='pending'", op.ID, op.Owner, op.Account); err != nil {
 		return err
 	}
 	if err = s.rewriteRenameRefs(ctx, op); err != nil {
@@ -186,22 +196,22 @@ func (s *Service) applyRename(ctx context.Context, c *Connection, op folderOpera
 	if err = s.commitLocked(ctx, op.Owner, op.Account, op.Actor, op.Transaction, []Change{{Entity: "rename", Op: "put", Key: op.ID, Rename: &rename}, {Entity: "pref", Op: "put", Key: op.Owner, Preferences: &prefs}}); err != nil {
 		return err
 	}
-	expires := time.Now().Add(14 * 24 * time.Hour)
-	_, err = s.db.Collection("mail_folder_ops").UpdateOne(ctx, bson.M{"_id": op.ID, "owner": op.Owner, "account": op.Account, "state": "pending"}, bson.M{"$set": bson.M{"state": "done", "expires": expires}})
+	_, err = s.pool.Exec(ctx, "UPDATE mail_folder_ops SET state='done', expires=$4 WHERE id=$1 AND owner=$2 AND account=$3 AND state='pending'", op.ID, op.Owner, op.Account, time.Now().Add(14*24*time.Hour))
 	return err
 }
 func (s *Service) rewriteRenameRefs(ctx context.Context, op folderOperation) error {
-	scope := bson.M{"owner": op.Owner, "account": op.Account}
-	rows, err := s.db.Collection("mail_moves").Find(ctx, scope)
+	rows, err := s.pool.Query(ctx, "SELECT "+moveColumns+" FROM mail_moves WHERE owner=$1 AND account=$2", op.Owner, op.Account)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close(ctx) }()
-	for rows.Next(ctx) {
+	moves, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Move, error) {
 		var job Move
-		if err = rows.Decode(&job); err != nil {
-			return err
-		}
+		return job, row.Scan(job.fields()...)
+	})
+	if err != nil {
+		return err
+	}
+	for _, job := range moves {
 		changed := false
 		for _, path := range []*string{&job.From.Folder, &job.Target, &job.Current.Folder, &job.ReturnTarget} {
 			next := op.path(*path)
@@ -211,48 +221,42 @@ func (s *Service) rewriteRenameRefs(ctx context.Context, op folderOperation) err
 			}
 		}
 		if changed {
-			if _, err = s.db.Collection("mail_moves").ReplaceOne(ctx, bson.M{"_id": job.ID, "owner": op.Owner, "account": op.Account}, job); err != nil {
+			if err = s.saveMove(ctx, job); err != nil {
 				return err
 			}
 		}
 	}
-	if err = rows.Err(); err != nil {
-		return err
-	}
-	ruleRows, err := s.db.Collection("mail_rule_jobs").Find(ctx, bson.M{"owner": op.Owner, "account": op.Account, "state": bson.M{"$in": []string{"pending", "failed"}}})
+	ruleRows, err := s.pool.Query(ctx, "SELECT "+ruleJobColumns+" FROM mail_rule_jobs WHERE owner=$1 AND account=$2 AND state IN ('pending','failed')", op.Owner, op.Account)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = ruleRows.Close(ctx) }()
-	for ruleRows.Next(ctx) {
-		var job RuleJob
-		if err = ruleRows.Decode(&job); err != nil {
-			return err
-		}
-		folder := op.path(job.Source.Folder)
+	ruleJobs, err := pgx.CollectRows(ruleRows, scanRuleJob)
+	if err != nil {
+		return err
+	}
+	for _, job := range ruleJobs {
 		actions := job.Actions
 		for i := range actions {
 			if actions[i].Action == "move" {
 				actions[i].Target = op.path(actions[i].Target)
 			}
 		}
-		if _, err = s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": job.ID, "owner": op.Owner, "account": op.Account}, bson.M{"$set": bson.M{"source.folder": folder, "actions": actions}}); err != nil {
+		if _, err = s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET source_folder=$4, actions=$5 WHERE id=$1 AND owner=$2 AND account=$3", job.ID, op.Owner, op.Account, op.path(job.Source.Folder), actionRows(actions)); err != nil {
 			return err
 		}
 	}
-	if err = ruleRows.Err(); err != nil {
-		return err
-	}
-	applications, err := s.db.Collection("mail_rule_applications").Find(ctx, bson.M{"owner": op.Owner, "account": op.Account, "state": "pending"})
+	appRows, err := s.pool.Query(ctx, "SELECT id, folder, rules FROM mail_rule_applications WHERE owner=$1 AND account=$2 AND state='pending'", op.Owner, op.Account)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = applications.Close(ctx) }()
-	for applications.Next(ctx) {
+	applications, err := pgx.CollectRows(appRows, func(row pgx.CollectableRow) (RuleApplication, error) {
 		var job RuleApplication
-		if err = applications.Decode(&job); err != nil {
-			return err
-		}
+		return job, row.Scan(&job.ID, &job.Folder, &job.Rules)
+	})
+	if err != nil {
+		return err
+	}
+	for _, job := range applications {
 		for i := range job.Rules {
 			if job.Rules[i].Action == "move" {
 				job.Rules[i].Target = op.path(job.Rules[i].Target)
@@ -263,23 +267,22 @@ func (s *Service) rewriteRenameRefs(ctx context.Context, op folderOperation) err
 				}
 			}
 		}
-		if _, err = s.db.Collection("mail_rule_applications").UpdateOne(ctx, bson.M{"_id": job.ID, "state": "pending"}, bson.M{"$set": bson.M{"folder": op.path(job.Folder), "rules": job.Rules}}); err != nil {
+		if _, err = s.pool.Exec(ctx, "UPDATE mail_rule_applications SET folder=$2, rules=$3 WHERE id=$1 AND state='pending'", job.ID, op.path(job.Folder), job.Rules); err != nil {
 			return err
 		}
 	}
-	if err = applications.Err(); err != nil {
-		return err
-	}
-	outbox, err := s.db.Collection("mail_outbox").Find(ctx, bson.M{"owner": op.Owner, "account": op.Account, "payload": bson.M{"$exists": true}, "status": bson.M{"$in": []string{"pending", "sending", "uncertain", "cancelled", "restored"}}})
+	outboxRows, err := s.pool.Query(ctx, "SELECT id, payload FROM mail_outbox WHERE owner=$1 AND account=$2 AND payload IS NOT NULL AND status IN ('pending','sending','uncertain','cancelled','restored')", op.Owner, op.Account)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = outbox.Close(ctx) }()
-	for outbox.Next(ctx) {
+	outbox, err := pgx.CollectRows(outboxRows, func(row pgx.CollectableRow) (Outbox, error) {
 		var job Outbox
-		if err = outbox.Decode(&job); err != nil {
-			return err
-		}
+		return job, row.Scan(&job.ID, &job.Payload)
+	})
+	if err != nil {
+		return err
+	}
+	for _, job := range outbox {
 		raw, err := s.open(job.Payload)
 		if err != nil {
 			return err
@@ -297,16 +300,15 @@ func (s *Service) rewriteRenameRefs(ctx context.Context, op folderOperation) err
 		if err != nil {
 			return err
 		}
-		if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": job.ID, "owner": op.Owner, "account": op.Account, "payload": job.Payload}, bson.M{"$set": bson.M{"payload": s.seal(raw)}}); err != nil {
+		if _, err = s.pool.Exec(ctx, "UPDATE mail_outbox SET payload=$5 WHERE id=$1 AND owner=$2 AND account=$3 AND payload=$4", job.ID, op.Owner, op.Account, job.Payload, s.seal(raw)); err != nil {
 			return err
 		}
 	}
-	return outbox.Err()
+	return nil
 }
 func (s *Service) runRename(ctx context.Context) error {
-	var op folderOperation
-	err := s.db.Collection("mail_folder_ops").FindOne(ctx, bson.M{"state": "pending", "next_attempt": bson.M{"$lte": time.Now()}}, options.FindOne().SetSort(bson.D{{Key: "created", Value: 1}})).Decode(&op)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	op, err := s.loadOp(ctx, "state='pending' AND next_attempt <= now() ORDER BY created")
+	if errors.Is(err, pg.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -320,30 +322,32 @@ func (s *Service) runRename(ctx context.Context) error {
 	ctx = work
 	m, err := s.Mailbox(ctx, op.Owner, op.Actor)
 	if err == nil && m.account != op.Account {
-		_, err = s.db.Collection("mail_folder_ops").UpdateOne(ctx, bson.M{"_id": op.ID, "owner": op.Owner, "account": op.Account, "state": "pending"}, bson.M{"$set": bson.M{"state": "cancelled", "expires": time.Now().Add(14 * 24 * time.Hour)}})
+		_, err = s.pool.Exec(ctx, "UPDATE mail_folder_ops SET state='cancelled', expires=$4 WHERE id=$1 AND owner=$2 AND account=$3 AND state='pending'", op.ID, op.Owner, op.Account, time.Now().Add(14*24*time.Hour))
 		return err
 	}
 	if err == nil {
 		err = m.changeCommand(ctx, nil, true, func(ctx context.Context, c *Connection) error { return s.applyRename(ctx, c, op) })
 	}
 	if err != nil {
-		_, updateErr := s.db.Collection("mail_folder_ops").UpdateOne(context.WithoutCancel(ctx), bson.M{"_id": op.ID, "state": "pending"}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(time.Minute), "error": cutText(err.Error(), 500)}})
+		_, updateErr := s.pool.Exec(context.WithoutCancel(ctx), "UPDATE mail_folder_ops SET next_attempt=$2, error=$3 WHERE id=$1 AND state='pending'", op.ID, time.Now().Add(time.Minute), cutText(err.Error(), 500))
 		return errors.Join(err, updateErr)
 	}
 	return nil
 }
 
 func (s *Service) remapSendSources(ctx context.Context, owner, account string, message *Send) error {
-	rows, err := s.db.Collection("mail_folder_ops").Find(ctx, bson.M{"owner": owner, "account": account, "state": "done"}, options.Find().SetSort(bson.D{{Key: "created", Value: 1}}))
+	rows, err := s.pool.Query(ctx, "SELECT "+opColumns+" FROM mail_folder_ops WHERE owner=$1 AND account=$2 AND state='done' ORDER BY created", owner, account)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close(ctx) }()
-	for rows.Next(ctx) {
+	ops, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (folderOperation, error) {
 		var op folderOperation
-		if err = rows.Decode(&op); err != nil {
-			return err
-		}
+		return op, row.Scan(op.fields()...)
+	})
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
 		if message.ReplyValidity != 0 && op.Generations[message.ReplyFolder] == message.ReplyValidity {
 			message.ReplyFolder = op.path(message.ReplyFolder)
 		}
@@ -351,5 +355,5 @@ func (s *Service) remapSendSources(ctx context.Context, owner, account string, m
 			message.DraftFolder = op.path(message.DraftFolder)
 		}
 	}
-	return rows.Err()
+	return nil
 }

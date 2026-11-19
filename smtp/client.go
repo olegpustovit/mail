@@ -13,8 +13,8 @@ import (
 
 	"github.com/emersion/go-message/mail"
 	"github.com/google/uuid"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmessage"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/mailmessage"
 )
 
 const (

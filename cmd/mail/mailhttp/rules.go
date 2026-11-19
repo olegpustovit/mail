@@ -1,7 +1,7 @@
 package mailhttp
 
 import (
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
 	"net/http"
 )
 

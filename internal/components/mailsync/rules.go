@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"html"
 	"net/http"
 	"net/mail"
@@ -12,28 +13,43 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmessage"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/mailmessage"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 type RuleCondition struct {
-	Field string `json:"field" bson:"field"`
-	Match string `json:"match" bson:"match"`
-	Value string `json:"value" bson:"value"`
+	Field string `json:"field"`
+	Match string `json:"match"`
+	Value string `json:"value"`
 }
 type RuleAction struct {
-	Action        string `json:"action" bson:"action"`
-	Target        string `json:"target,omitempty" bson:"target,omitempty"`
-	Key           string `json:"-" bson:"key,omitempty"`
-	RuleID        string `json:"-" bson:"rule_id,omitempty"`
-	ConditionHash string `json:"-" bson:"condition_hash,omitempty"`
-	Index         int    `json:"-" bson:"index,omitempty"`
+	Action        string `json:"action"`
+	Target        string `json:"target,omitempty"`
+	Key           string `json:"-"`
+	RuleID        string `json:"-"`
+	ConditionHash string `json:"-"`
+	Index         int    `json:"-"`
 }
 
+// actionRow stores RuleAction with its internal fields, which the API json hides.
+type actionRow struct {
+	Action        string `json:"action"`
+	Target        string `json:"target,omitempty"`
+	Key           string `json:"key,omitempty"`
+	RuleID        string `json:"rule_id,omitempty"`
+	ConditionHash string `json:"condition_hash,omitempty"`
+	Index         int    `json:"index,omitempty"`
+}
+
+func actionRows(actions []RuleAction) []actionRow {
+	rows := make([]actionRow, len(actions))
+	for i, a := range actions {
+		rows[i] = actionRow(a)
+	}
+	return rows
+}
 func (r Rule) conditions() []RuleCondition {
 	if len(r.Conditions) > 0 {
 		return r.Conditions
@@ -185,6 +201,48 @@ type RuleJob struct {
 	Expires     *time.Time    `bson:"expires,omitempty" json:"-"`
 }
 
+const ruleJobColumns = "id, owner, account, source_folder, source_uid, source_validity, source_key, subject, actions, step, state, created, next_attempt, attempts, error, expires"
+
+func (j *RuleJob) fields(actions *[]actionRow) []any {
+	return []any{&j.ID, &j.Owner, &j.Account, &j.Source.Folder, &j.Source.ID, &j.Source.Validity, &j.SourceKey, &j.Subject, actions, &j.Step, &j.State, &j.Created, &j.NextAttempt, &j.Attempts, &j.Error, &j.Expires}
+}
+func scanRuleJob(row pgx.CollectableRow) (RuleJob, error) {
+	var job RuleJob
+	var rows []actionRow
+	if err := row.Scan(job.fields(&rows)...); err != nil {
+		return job, err
+	}
+	job.Actions = make([]RuleAction, len(rows))
+	for i, a := range rows {
+		job.Actions[i] = RuleAction(a)
+	}
+	return job, nil
+}
+func (s *Service) loadRuleJob(ctx context.Context, where string, args ...any) (RuleJob, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+ruleJobColumns+" FROM mail_rule_jobs WHERE "+where+" LIMIT 1", args...)
+	if err != nil {
+		return RuleJob{}, err
+	}
+	job, err := pgx.CollectOneRow(rows, scanRuleJob)
+	return job, err
+}
+
+const ruleApplicationColumns = "id, owner, account, rules, folder, validity, max_uid, after, scanned, matched, state, error, created, expires"
+
+func (j *RuleApplication) fields() []any {
+	return []any{&j.ID, &j.Owner, &j.Account, &j.Rules, &j.Folder, &j.Validity, &j.MaxUID, &j.After, &j.Scanned, &j.Matched, &j.State, &j.Error, &j.Created, &j.Expires}
+}
+func scanRuleApplication(row pgx.CollectableRow) (RuleApplication, error) {
+	var job RuleApplication
+	return job, row.Scan(job.fields()...)
+}
+func (s *Service) loadRuleApplication(ctx context.Context, where string, args ...any) (RuleApplication, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+ruleApplicationColumns+" FROM mail_rule_applications WHERE "+where+" LIMIT 1", args...)
+	if err != nil {
+		return RuleApplication{}, err
+	}
+	return pgx.CollectOneRow(rows, scanRuleApplication)
+}
 func newRuleJob(owner, account string, rules []Rule, m Metadata) *RuleJob {
 	actions := ruleActions(rules, m)
 	if len(actions) == 0 {
@@ -197,12 +255,14 @@ func (s *Service) insertRuleJobs(ctx context.Context, jobs []RuleJob) error {
 	if len(jobs) == 0 {
 		return nil
 	}
-	writes := make([]mongo.WriteModel, len(jobs))
-	for i, job := range jobs {
-		writes[i] = mongo.NewUpdateOneModel().SetFilter(bson.M{"_id": job.ID, "owner": job.Owner, "account": job.Account}).SetUpdate(bson.M{"$setOnInsert": job}).SetUpsert(true)
+	batch := &pgx.Batch{}
+	for _, job := range jobs {
+		var rows []actionRow
+		args := job.fields(&rows)
+		rows = actionRows(job.Actions)
+		batch.Queue("INSERT INTO mail_rule_jobs ("+ruleJobColumns+") VALUES ("+marks(1, 16)+") ON CONFLICT DO NOTHING", args...)
 	}
-	_, err := s.db.Collection("mail_rule_jobs").BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(true))
-	return err
+	return s.pool.SendBatch(ctx, batch).Close()
 }
 
 type RulePreview struct {
@@ -228,7 +288,7 @@ func (s *Service) PreviewRule(ctx context.Context, owner string, rule Rule) (Rul
 			inbox = f.Name
 		}
 	}
-	rows, err := s.metadata(ctx, owner, account, bson.M{"email.folder": inbox}, 500)
+	rows, err := s.metadata(ctx, owner, account, "folder = $3", []any{inbox}, "", 500)
 	if err != nil {
 		return RulePreview{}, err
 	}
@@ -286,13 +346,12 @@ func (s *Service) ApplyRules(ctx context.Context, owner, digest string) (RuleApp
 	}
 	now := time.Now().UTC()
 	job := RuleApplication{ID: identity(owner, account, "apply", digest, inbox.Name, fmt.Sprint(inbox.UIDValidity), fmt.Sprint(inbox.UIDNext)), Owner: owner, Account: account, Rules: p.Rules, Folder: inbox.Name, Validity: inbox.UIDValidity, MaxUID: inbox.UIDNext - 1, State: "pending", Created: now}
-	_, err = s.db.Collection("mail_rule_applications").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$setOnInsert": job}, options.UpdateOne().SetUpsert(true))
+	_, err = s.pool.Exec(ctx, "INSERT INTO mail_rule_applications ("+ruleApplicationColumns+") VALUES ("+marks(1, 14)+") ON CONFLICT DO NOTHING", job.fields()...)
 	return job, err
 }
 func (s *Service) runRuleApplication(ctx context.Context) error {
-	var job RuleApplication
-	err := s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"state": "pending", "$or": []bson.M{{"next_attempt": bson.M{"$exists": false}}, {"next_attempt": bson.M{"$lte": time.Now()}}}}, options.FindOne().SetSort(bson.D{{Key: "created", Value: 1}})).Decode(&job)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	job, err := s.loadRuleApplication(ctx, "state='pending' AND (next_attempt IS NULL OR next_attempt <= now()) ORDER BY created")
+	if errors.Is(err, pg.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -307,7 +366,7 @@ func (s *Service) runRuleApplication(ctx context.Context) error {
 	state := s.owner(job.Owner)
 	state.write.Lock()
 	defer state.write.Unlock()
-	if err = s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"_id": job.ID, "state": "pending"}).Decode(&job); errors.Is(err, mongo.ErrNoDocuments) {
+	if job, err = s.loadRuleApplication(ctx, "id=$1 AND state='pending'", job.ID); errors.Is(err, pg.ErrNoRows) {
 		return nil
 	} else if err != nil {
 		return err
@@ -322,18 +381,20 @@ func (s *Service) runRuleApplication(ctx context.Context) error {
 	if err = s.checkRenamePending(ctx, job.Owner, job.Account); err != nil {
 		return nil
 	}
-	var folder Folder
-	err = s.db.Collection("mail_folders").FindOne(ctx, bson.M{"owner": job.Owner, "account": job.Account, "info.name": job.Folder}).Decode(&folder)
-	if err != nil || folder.UIDValidity != job.Validity {
-		return s.finishRuleApplication(ctx, job, "failed", "Inbox generation changed; run again after syncing.")
-	}
-	rows, err := s.db.Collection("mail_messages").Find(ctx, bson.M{"owner": job.Owner, "account": job.Account, "email.folder": job.Folder, "email.uidvalidity": job.Validity, "_id": bson.M{"$gt": job.After}}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetLimit(200))
+	folders, err := s.Folders(ctx, job.Owner, job.Account)
 	if err != nil {
 		return err
 	}
-	var messages []Metadata
-	err = rows.All(ctx, &messages)
-	_ = rows.Close(ctx)
+	var folder Folder
+	for _, f := range folders {
+		if f.Name == job.Folder {
+			folder = f
+		}
+	}
+	if folder.UIDValidity != job.Validity {
+		return s.finishRuleApplication(ctx, job, "failed", "Inbox generation changed; run again after syncing.")
+	}
+	messages, err := s.metadata(ctx, job.Owner, job.Account, "folder = $3 AND uidvalidity = $4 AND key > $5", []any{job.Folder, job.Validity, job.After}, "key", 200)
 	if err != nil {
 		return err
 	}
@@ -358,23 +419,22 @@ func (s *Service) runRuleApplication(ctx context.Context) error {
 		expires := time.Now().Add(14 * 24 * time.Hour)
 		job.Expires = &expires
 	}
-	_, err = s.db.Collection("mail_rule_applications").ReplaceOne(ctx, bson.M{"_id": job.ID, "state": "pending"}, job)
+	_, err = s.pool.Exec(ctx, "UPDATE mail_rule_applications SET (rules, folder, validity, max_uid, after, scanned, matched, state, error, expires) = ($2,$3,$4,$5,$6,$7,$8,$9,$10,$11) WHERE id=$1 AND state='pending'", job.ID, job.Rules, job.Folder, job.Validity, job.MaxUID, job.After, job.Scanned, job.Matched, job.State, job.Error, job.Expires)
 	return err
 }
 func (s *Service) finishRuleApplication(ctx context.Context, job RuleApplication, state, problem string) error {
-	_, err := s.db.Collection("mail_rule_applications").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"state": state, "error": problem, "expires": time.Now().Add(14 * 24 * time.Hour)}})
+	_, err := s.pool.Exec(ctx, "UPDATE mail_rule_applications SET state=$2, error=$3, expires=$4 WHERE id=$1", job.ID, state, problem, time.Now().Add(14*24*time.Hour))
 	return err
 }
 func (s *Service) ruleForward(ctx context.Context, job RuleJob, action RuleAction) error {
 	tx := "rule:" + identity(job.SourceKey, action.Key)
 	// Check the durable send receipt before fetching mail that a later action may already have moved.
-	var existing Outbox
-	err := s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": auth.Hash(job.Owner + "\x00" + tx), "owner": job.Owner, "account": job.Account}).Decode(&existing)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, mongo.ErrNoDocuments) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM mail_outbox WHERE id=$1 AND owner=$2 AND account=$3)", auth.Hash(job.Owner+"\x00"+tx), job.Owner, job.Account).Scan(&exists); err != nil {
 		return err
+	}
+	if exists {
+		return nil
 	}
 	if strings.EqualFold(action.Target, job.Account) {
 		return errors.New("a forwarding rule cannot target the linked account")
@@ -451,7 +511,8 @@ func (s *Service) advanceRule(ctx context.Context, job RuleJob) error {
 	}
 	box := &Mailbox{s: s, owner: job.Owner, account: job.Account, actor: "rule"}
 	for job.Step < len(job.Actions) {
-		if err := s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"_id": job.ID, "owner": job.Owner, "account": job.Account, "state": "pending"}).Decode(&job); err != nil {
+		var err error
+		if job, err = s.loadRuleJob(ctx, "id=$1 AND owner=$2 AND account=$3 AND state='pending'", job.ID, job.Owner, job.Account); err != nil {
 			return err
 		}
 		action := job.Actions[job.Step]
@@ -506,21 +567,16 @@ func (s *Service) advanceRule(ctx context.Context, job RuleJob) error {
 			return err
 		}
 		job.Step++
-		update := bson.M{"step": job.Step, "error": ""}
-		if job.Step == len(job.Actions) {
-			update["state"] = "done"
-			update["expires"] = time.Now().Add(14 * 24 * time.Hour)
-		}
-		if _, err = s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": job.ID, "owner": job.Owner, "account": job.Account, "state": "pending"}, bson.M{"$set": update}); err != nil {
+		done := job.Step == len(job.Actions)
+		if _, err = s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET step=$4, error='', state=CASE WHEN $5 THEN 'done' ELSE state END, expires=CASE WHEN $5 THEN $6 ELSE expires END WHERE id=$1 AND owner=$2 AND account=$3 AND state='pending'", job.ID, job.Owner, job.Account, job.Step, done, time.Now().Add(14*24*time.Hour)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 func (s *Service) runRuleJob(ctx context.Context) error {
-	var job RuleJob
-	err := s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"state": "pending", "next_attempt": bson.M{"$lte": time.Now()}}, options.FindOne().SetSort(bson.D{{Key: "created", Value: 1}})).Decode(&job)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	job, err := s.loadRuleJob(ctx, "state='pending' AND next_attempt <= now() ORDER BY created")
+	if errors.Is(err, pg.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -536,11 +592,11 @@ func (s *Service) runRuleJob(ctx context.Context) error {
 		if ctx.Err() != nil {
 			maintenance, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 			defer cancel()
-			_, e := s.db.Collection("mail_rule_jobs").UpdateOne(maintenance, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(30 * time.Second)}})
+			_, e := s.pool.Exec(maintenance, "UPDATE mail_rule_jobs SET next_attempt=$2 WHERE id=$1", job.ID, time.Now().Add(30*time.Second))
 			return e
 		}
 		if errors.Is(err, ErrRenamePending) {
-			_, e := s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(10 * time.Second), "error": "Paused until folder rename recovery completes."}})
+			_, e := s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET next_attempt=$2, error='Paused until folder rename recovery completes.' WHERE id=$1", job.ID, time.Now().Add(10*time.Second))
 			return e
 		}
 		job.Attempts++
@@ -548,11 +604,7 @@ func (s *Service) runRuleJob(ctx context.Context) error {
 		if job.Attempts >= 5 {
 			state = "failed"
 		}
-		update := bson.M{"state": state, "error": cutText(err.Error(), 500), "attempts": job.Attempts, "next_attempt": time.Now().Add(time.Duration(job.Attempts) * time.Minute)}
-		if state == "failed" {
-			update["expires"] = time.Now().Add(14 * 24 * time.Hour)
-		}
-		_, e := s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": update})
+		_, e := s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET state=$2, error=$3, attempts=$4, next_attempt=$5, expires=CASE WHEN $2='failed' THEN $6 ELSE expires END WHERE id=$1", job.ID, state, cutText(err.Error(), 500), job.Attempts, time.Now().Add(time.Duration(job.Attempts)*time.Minute), time.Now().Add(14*24*time.Hour))
 		return e
 	}
 	return nil
@@ -590,21 +642,18 @@ func (s *Service) RulesStatus(ctx context.Context, owner string) (RulesStatus, e
 		return RulesStatus{}, err
 	}
 	status := RulesStatus{Digest: ruleDigest(p.Rules), Jobs: []RuleJob{}, Applications: []RuleApplication{}}
-	rows, err := s.db.Collection("mail_rule_jobs").Find(ctx, bson.M{"owner": owner, "account": account, "state": bson.M{"$in": []string{"pending", "failed"}}}, options.Find().SetSort(bson.D{{Key: "created", Value: -1}}).SetLimit(30))
+	rows, err := s.pool.Query(ctx, "SELECT "+ruleJobColumns+" FROM mail_rule_jobs WHERE owner=$1 AND account=$2 AND state IN ('pending','failed') ORDER BY created DESC LIMIT 30", owner, account)
 	if err != nil {
 		return status, err
 	}
-	err = rows.All(ctx, &status.Jobs)
-	_ = rows.Close(ctx)
+	if status.Jobs, err = pgx.CollectRows(rows, scanRuleJob); err != nil {
+		return status, err
+	}
+	rows, err = s.pool.Query(ctx, "SELECT "+ruleApplicationColumns+" FROM mail_rule_applications WHERE owner=$1 AND account=$2 ORDER BY created DESC LIMIT 5", owner, account)
 	if err != nil {
 		return status, err
 	}
-	rows, err = s.db.Collection("mail_rule_applications").Find(ctx, bson.M{"owner": owner, "account": account}, options.Find().SetSort(bson.D{{Key: "created", Value: -1}}).SetLimit(5))
-	if err != nil {
-		return status, err
-	}
-	err = rows.All(ctx, &status.Applications)
-	_ = rows.Close(ctx)
+	status.Applications, err = pgx.CollectRows(rows, scanRuleApplication)
 	return status, err
 }
 func (s *Service) RetryRuleJob(ctx context.Context, owner, id string) error {
@@ -612,6 +661,6 @@ func (s *Service) RetryRuleJob(ctx context.Context, owner, id string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Collection("mail_rule_jobs").UpdateOne(ctx, bson.M{"_id": id, "owner": owner, "account": account, "state": "failed"}, bson.M{"$set": bson.M{"state": "pending", "attempts": 0, "error": "", "next_attempt": time.Now()}, "$unset": bson.M{"expires": ""}})
+	_, err = s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET state='pending', attempts=0, error='', next_attempt=now(), expires=NULL WHERE id=$1 AND owner=$2 AND account=$3 AND state='failed'", id, owner, account)
 	return err
 }

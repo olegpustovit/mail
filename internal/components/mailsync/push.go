@@ -15,23 +15,22 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
-	"github.com/olegpustovit/mcp-icloud-email/internal/publichttp"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/jackc/pgx/v5"
+	"github.com/olegpustovit/mail/internal/pg"
+	"github.com/olegpustovit/mail/internal/publichttp"
 )
 
 type PushDevice struct {
-	ID          string    `bson:"_id" json:"id"`
-	Owner       string    `bson:"owner" json:"-"`
-	Account     string    `bson:"account" json:"-"`
-	Session     string    `bson:"session" json:"-"`
-	Name        string    `bson:"name" json:"name"`
-	Zone        string    `bson:"zone" json:"zone"`
-	Payload     []byte    `bson:"payload" json:"-"`
-	Cursor      int64     `bson:"cursor" json:"-"`
-	NextAttempt time.Time `bson:"next_attempt" json:"-"`
-	Error       string    `bson:"error" json:"error,omitempty"`
+	ID          string    `json:"id"`
+	Owner       string    `json:"-"`
+	Account     string    `json:"-"`
+	Session     string    `json:"-"`
+	Name        string    `json:"name"`
+	Zone        string    `json:"zone"`
+	Payload     []byte    `json:"-"`
+	Cursor      int64     `json:"-"`
+	NextAttempt time.Time `json:"-"`
+	Error       string    `json:"error,omitempty"`
 }
 type PushRegistration struct {
 	Subscription webpush.Subscription `json:"subscription"`
@@ -39,9 +38,9 @@ type PushRegistration struct {
 	Zone         string               `json:"zone"`
 }
 type pushKeys struct {
-	ID      string `bson:"_id"`
-	Public  string `bson:"public"`
-	Private []byte `bson:"private"`
+	ID      string
+	Public  string
+	Private []byte
 }
 
 func (s *Service) ConfigurePush(validSession func(context.Context, string, string) (bool, error), subject string) {
@@ -53,10 +52,26 @@ func (s *Service) ConfigurePush(validSession func(context.Context, string, strin
 		s.pushHTTP = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: publichttp.DialContext, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 5 * time.Second, MaxResponseHeaderBytes: 32 << 10}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 }
+
+const pushCols = `id, owner, account, session, name, zone, payload, "cursor", next_attempt, error`
+
+func scanPush(row pgx.CollectableRow) (PushDevice, error) {
+	var d PushDevice
+	err := row.Scan(&d.ID, &d.Owner, &d.Account, &d.Session, &d.Name, &d.Zone, &d.Payload, &d.Cursor, &d.NextAttempt, &d.Error)
+	return d, err
+}
+func (s *Service) queryPush(ctx context.Context, sql string, args ...any) ([]PushDevice, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanPush)
+}
 func (s *Service) pushKeys(ctx context.Context) (pushKeys, error) {
 	var keys pushKeys
-	err := s.db.Collection("mail_push_keys").FindOne(ctx, bson.M{"_id": "vapid"}).Decode(&keys)
-	if !errors.Is(err, mongo.ErrNoDocuments) {
+	const query = "SELECT id, public, private FROM mail_push_keys WHERE id = 'vapid'"
+	err := s.pool.QueryRow(ctx, query).Scan(&keys.ID, &keys.Public, &keys.Private)
+	if !errors.Is(err, pg.ErrNoRows) {
 		return keys, err
 	}
 	private, public, err := webpush.GenerateVAPIDKeys()
@@ -64,9 +79,9 @@ func (s *Service) pushKeys(ctx context.Context) (pushKeys, error) {
 		return keys, err
 	}
 	keys = pushKeys{ID: "vapid", Public: public, Private: s.seal([]byte(private))}
-	_, err = s.db.Collection("mail_push_keys").InsertOne(ctx, keys)
-	if mongo.IsDuplicateKeyError(err) {
-		err = s.db.Collection("mail_push_keys").FindOne(ctx, bson.M{"_id": "vapid"}).Decode(&keys)
+	_, err = s.pool.Exec(ctx, "INSERT INTO mail_push_keys (id, public, private) VALUES ($1, $2, $3)", keys.ID, keys.Public, keys.Private)
+	if pg.IsUnique(err) {
+		err = s.pool.QueryRow(ctx, query).Scan(&keys.ID, &keys.Public, &keys.Private)
 	}
 	return keys, err
 }
@@ -128,7 +143,8 @@ func (s *Service) SavePushDevice(ctx context.Context, owner, session string, p P
 		return d, err
 	}
 	id := identity(p.Subscription.Endpoint)
-	count, err := s.db.Collection("mail_push_devices").CountDocuments(ctx, bson.M{"owner": owner, "_id": bson.M{"$ne": id}})
+	var count int
+	err = s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_push_devices WHERE owner = $1 AND id <> $2", owner, id).Scan(&count)
 	if err != nil {
 		return d, err
 	}
@@ -139,11 +155,11 @@ func (s *Service) SavePushDevice(ctx context.Context, owner, session string, p P
 	if err != nil {
 		return d, err
 	}
-	var existing PushDevice
-	err = s.db.Collection("mail_push_devices").FindOne(ctx, bson.M{"_id": id, "owner": owner, "account": account}).Decode(&existing)
+	var existing int64
+	err = s.pool.QueryRow(ctx, `SELECT "cursor" FROM mail_push_devices WHERE id = $1 AND owner = $2 AND account = $3`, id, owner, account).Scan(&existing)
 	if err == nil {
-		cursor = existing.Cursor
-	} else if !errors.Is(err, mongo.ErrNoDocuments) {
+		cursor = existing
+	} else if !errors.Is(err, pg.ErrNoRows) {
 		return d, err
 	}
 	raw, err := json.Marshal(p.Subscription)
@@ -152,7 +168,9 @@ func (s *Service) SavePushDevice(ctx context.Context, owner, session string, p P
 	}
 	d = PushDevice{ID: id, Owner: owner, Account: account, Session: session, Name: p.Name, Zone: p.Zone, Cursor: cursor, Payload: s.seal(raw), NextAttempt: time.Now().UTC()}
 	// Possession of the subscription's endpoint and keys rebinds this browser after an account change.
-	_, err = s.db.Collection("mail_push_devices").ReplaceOne(ctx, bson.M{"_id": id}, d, options.Replace().SetUpsert(true))
+	_, err = s.pool.Exec(ctx, `INSERT INTO mail_push_devices (`+pushCols+`) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (id) DO UPDATE SET owner = $2, account = $3, session = $4, name = $5, zone = $6, payload = $7, "cursor" = $8, next_attempt = $9, error = $10`,
+		d.ID, d.Owner, d.Account, d.Session, d.Name, d.Zone, d.Payload, d.Cursor, d.NextAttempt, d.Error)
 	return d, err
 }
 func (s *Service) PushDevices(ctx context.Context, owner string) ([]PushDevice, error) {
@@ -160,21 +178,14 @@ func (s *Service) PushDevices(ctx context.Context, owner string) ([]PushDevice, 
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Collection("mail_push_devices").Find(ctx, bson.M{"owner": owner, "account": account})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	devices := []PushDevice{}
-	err = rows.All(ctx, &devices)
-	return devices, err
+	return s.queryPush(ctx, "SELECT "+pushCols+" FROM mail_push_devices WHERE owner = $1 AND account = $2", owner, account)
 }
 func (s *Service) RemovePushDevice(ctx context.Context, owner, id string) error {
 	account, err := s.Account(ctx, owner)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Collection("mail_push_devices").DeleteOne(ctx, bson.M{"_id": id, "owner": owner, "account": account})
+	_, err = s.pool.Exec(ctx, "DELETE FROM mail_push_devices WHERE id = $1 AND owner = $2 AND account = $3", id, owner, account)
 	return err
 }
 func quietNow(p Preferences, now time.Time) bool {
@@ -233,6 +244,10 @@ func cutText(value string, limit int) string {
 	}
 	return value
 }
+func (s *Service) dropPushDevice(ctx context.Context, d PushDevice) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM mail_push_devices WHERE id = $1 AND owner = $2 AND session = $3", d.ID, d.Owner, d.Session)
+	return err
+}
 func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(context.Context, string, string) (bool, error), subject string, client *http.Client) error {
 	work, release, err := s.ownerWork(ctx, d.Owner)
 	if err != nil {
@@ -249,8 +264,7 @@ func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(conte
 		return err
 	}
 	if !ok || account != d.Account {
-		_, err = s.db.Collection("mail_push_devices").DeleteOne(ctx, bson.M{"_id": d.ID, "owner": d.Owner, "session": d.Session})
-		return err
+		return s.dropPushDevice(ctx, d)
 	}
 	p, err := s.Preferences(ctx, d.Owner)
 	if err != nil {
@@ -264,24 +278,28 @@ func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(conte
 	if err != nil {
 		return err
 	}
-	rows, err := s.db.Collection("mail_changelog").Find(ctx, bson.M{"owner": d.Owner, "account": d.Account, "committed": true, "arrival": true, "seq": bson.M{"$gt": d.Cursor, "$lte": high}}, options.Find().SetSort(bson.D{{Key: "seq", Value: 1}}).SetLimit(30))
+	// shortcut: Changes pages 1000 rows, so arrivals are filtered here; a full page without 30 arrivals advances only to its last row.
+	window, err := s.Changes(ctx, d.Owner, d.Account, d.Cursor)
 	if err != nil {
 		return err
 	}
 	var changes []Change
-	err = rows.All(ctx, &changes)
-	_ = rows.Close(ctx)
-	if err != nil {
-		return err
+	for _, c := range window {
+		if c.Arrival && c.Sequence <= high && len(changes) < 30 {
+			changes = append(changes, c)
+		}
+	}
+	reach := high
+	if len(window) == 1000 {
+		reach = min(high, window[len(window)-1].Sequence)
 	}
 	next := time.Now().Add(2 * time.Second)
 	failure := ""
 	for _, change := range changes {
 		now := time.Now()
 		if change.Message != nil && now.Sub(change.At) < 5*time.Minute {
-			var current Metadata
-			err = s.db.Collection("mail_messages").FindOne(ctx, bson.M{"_id": change.Key, "owner": d.Owner, "account": d.Account}).Decode(&current)
-			if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+			current, err := s.messageByKey(ctx, d.Owner, d.Account, change.Key)
+			if err != nil && !errors.Is(err, pg.ErrNoRows) {
 				return err
 			}
 			if err == nil && wantsNotification(p, account, current, now.In(zone)) {
@@ -320,8 +338,7 @@ func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(conte
 					_ = response.Body.Close()
 				}
 				if code == 404 || code == 410 {
-					_, err = s.db.Collection("mail_push_devices").DeleteOne(ctx, bson.M{"_id": d.ID, "owner": d.Owner, "session": d.Session})
-					return err
+					return s.dropPushDevice(ctx, d)
 				}
 				if sendErr != nil || code < 200 || code >= 300 {
 					failure = "Push delivery failed; retrying."
@@ -333,9 +350,9 @@ func (s *Service) pushDevice(ctx context.Context, d PushDevice, valid func(conte
 		d.Cursor = change.Sequence
 	}
 	if failure == "" && len(changes) < 30 {
-		d.Cursor = high
+		d.Cursor = reach
 	}
-	_, err = s.db.Collection("mail_push_devices").UpdateOne(ctx, bson.M{"_id": d.ID, "owner": d.Owner, "session": d.Session}, bson.M{"$set": bson.M{"cursor": d.Cursor, "next_attempt": next, "error": failure}})
+	_, err = s.pool.Exec(ctx, `UPDATE mail_push_devices SET "cursor" = $4, next_attempt = $5, error = $6 WHERE id = $1 AND owner = $2 AND session = $3`, d.ID, d.Owner, d.Session, d.Cursor, next, failure)
 	return err
 }
 func (s *Service) runPush() {
@@ -353,19 +370,13 @@ func (s *Service) runPush() {
 			if valid == nil {
 				continue
 			}
-			rows, err := s.db.Collection("mail_push_devices").Find(s.ctx, bson.M{"next_attempt": bson.M{"$lte": time.Now()}}, options.Find().SetSort(bson.D{{Key: "next_attempt", Value: 1}}).SetLimit(20))
-			if err != nil {
-				continue
-			}
-			var devices []PushDevice
-			err = rows.All(s.ctx, &devices)
-			_ = rows.Close(s.ctx)
+			devices, err := s.queryPush(s.ctx, "SELECT "+pushCols+" FROM mail_push_devices WHERE next_attempt <= now() ORDER BY next_attempt LIMIT 20")
 			if err != nil {
 				continue
 			}
 			for _, device := range devices {
 				if err = s.pushDevice(s.ctx, device, valid, subject, client); err != nil {
-					_, _ = s.db.Collection("mail_push_devices").UpdateOne(s.ctx, bson.M{"_id": device.ID, "session": device.Session}, bson.M{"$set": bson.M{"next_attempt": time.Now().Add(time.Minute), "error": "Push unavailable; retrying."}})
+					_, _ = s.pool.Exec(s.ctx, "UPDATE mail_push_devices SET next_attempt = $3, error = 'Push unavailable; retrying.' WHERE id = $1 AND session = $2", device.ID, device.Session, time.Now().Add(time.Minute))
 				}
 			}
 		}

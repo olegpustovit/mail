@@ -2,15 +2,12 @@ package mailsync
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func TestRenameLostResponseRestartAndReferences(t *testing.T) {
@@ -47,7 +44,7 @@ func TestRenameLostResponseRestartAndReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A partial mirror must not omit a live child's mailbox generation from recovery.
-	if _, err = s.db.Collection("mail_folders").DeleteOne(ctx, bson.M{"owner": "owner", "info.name": "Clients/Child"}); err != nil {
+	if _, err = s.pool.Exec(ctx, "DELETE FROM mail_folders WHERE owner=$1 AND name=$2", "owner", "Clients/Child"); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -70,20 +67,20 @@ func TestRenameLostResponseRestartAndReferences(t *testing.T) {
 	if retryErr != nil || retryReceipt.ID != job.ID {
 		t.Fatal("an overdue retry lost the original send receipt", retryErr)
 	}
-	if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"send_at": time.Now().Add(-time.Minute)}}); err != nil {
+	if _, err = s.pool.Exec(ctx, "UPDATE mail_outbox SET send_at=$2 WHERE id=$1", job.ID, time.Now().Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.deliverNext(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var paused Outbox
-	if err = s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": job.ID}).Decode(&paused); err != nil || paused.Status != "pending" || !paused.RetryAt.After(time.Now()) || len(paused.Payload) == 0 {
+	if err = s.pool.QueryRow(ctx, "SELECT status, retry_at, payload FROM mail_outbox WHERE id=$1", job.ID).Scan(&paused.Status, &paused.RetryAt, &paused.Payload); err != nil || paused.Status != "pending" || !paused.RetryAt.After(time.Now()) || len(paused.Payload) == 0 {
 		t.Fatal("paused delivery was not retained", err, paused.Status)
 	}
 	if err = s.deliverNext(ctx); err != nil {
 		t.Fatal("paused owner blocked the delivery worker", err)
 	}
-	if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"send_at": time.Now().Add(time.Hour)}}); err != nil {
+	if _, err = s.pool.Exec(ctx, "UPDATE mail_outbox SET send_at=$2 WHERE id=$1", job.ID, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	// A job claimed before rename recovery must stop before trying SMTP, retaining its payload.
@@ -93,7 +90,7 @@ func TestRenameLostResponseRestartAndReferences(t *testing.T) {
 	if err = s.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := newService(ctx, os.Getenv("MAIL_TEST_MONGODB_URI"), base64.StdEncoding.EncodeToString(make([]byte, 32)), s.credentials, s.db.Name())
+	resumed, err := reopenService(ctx, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,8 +140,8 @@ func TestRenameLostResponseRestartAndReferences(t *testing.T) {
 	if prefs.Rules[0].Target != "Clients/Child" {
 		t.Fatal("foreign rules changed")
 	}
-	var op folderOperation
-	if err = resumed.db.Collection("mail_folder_ops").FindOne(ctx, bson.M{"owner": "owner"}).Decode(&op); err != nil || op.State != "done" {
+	op, err := resumed.loadOp(ctx, "owner=$1", "owner")
+	if err != nil || op.State != "done" {
 		t.Fatal("rename not finished", err)
 	}
 	c, release, err := resumed.Acquire(ctx, "owner")

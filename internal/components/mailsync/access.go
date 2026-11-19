@@ -3,9 +3,8 @@ package mailsync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // AccessGuard is configured before the hosted worker loops start. Stdio and
@@ -38,6 +37,7 @@ func (s *Service) jobWork(ctx context.Context, owner, collection, id, field stri
 	}
 	maintenance, stop := context.WithTimeout(ctx, 2*time.Second)
 	defer stop()
-	_, updateErr := s.db.Collection(collection).UpdateOne(maintenance, bson.M{"_id": id, "owner": owner}, bson.M{"$set": bson.M{field: time.Now().Add(30 * time.Second)}})
+	// collection and field are code constants, never user input.
+	_, updateErr := s.pool.Exec(maintenance, fmt.Sprintf("UPDATE %s SET %s = $1 WHERE id = $2 AND owner = $3", collection, field), time.Now().Add(30*time.Second), id, owner)
 	return next, func() {}, false, updateErr
 }

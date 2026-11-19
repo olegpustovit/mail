@@ -8,7 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 // SendEmailHandler creates a handler for sending emails

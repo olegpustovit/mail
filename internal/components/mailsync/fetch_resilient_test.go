@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func TestFetchResilientQuarantinesLoggedBodyStructureUIDInBatchOfFifty(t *testing.T) {

@@ -7,10 +7,10 @@ import {join, resolve} from 'node:path';
 import {spawn, execFileSync} from 'node:child_process';
 
 // Called only by Identity's owned PostgreSQL/captured-email runner, inside an
-// independently owned native Mongo process. No configured production service.
+// independently owned test PostgreSQL database. No configured production service.
 export async function lifecycle({browser,base,mail,setupCode,root,fixtureSql}) {
   assert(['localhost','127.0.0.1'].includes(new URL(base).hostname));
-  assert(/^mongodb:\/\/127\.0\.0\.1:\d+$/.test(process.env.MAIL_TEST_MONGODB_URI||''),'owned loopback Mongo required');
+  assert(/^postgres(ql)?:\/\//.test(process.env.MAIL_TEST_POSTGRES_URI||''),'MAIL_TEST_POSTGRES_URI required');
   const contexts=[];
   async function context() {
     const ctx=await browser.newContext({ignoreHTTPSErrors:true});contexts.push(ctx);
@@ -69,7 +69,7 @@ export async function lifecycle({browser,base,mail,setupCode,root,fixtureSql}) {
     }
     await save([{id:'eval-mail-native',name:'eval Mail native',description:'Owned fixture',archived:false,selectors:['eval-native@olegpustovit.com','eval-outsider@example.test'],members:[],apps:[created.app.id]}],[]);
     const binary=resolve(import.meta.dirname,'../mail-server');
-    child=spawn(binary,[],{cwd:resolve(import.meta.dirname,'..'),stdio:['ignore','pipe','pipe'],env:{...process.env,MAIL_BASE_URL:appOrigin,MAIL_ADDR:`127.0.0.1:${appPort}`,MAIL_MONGODB_URI:process.env.MAIL_TEST_MONGODB_URI,MAIL_ENCRYPTION_KEY:randomBytes(32).toString('base64'),MAIL_ID_ISSUER:base,MAIL_ID_CLIENT_ID:created.app.id,MAIL_ID_CLIENT_SECRET:created.client_secret,MAIL_ID_COOKIE_KEY:randomBytes(32).toString('base64'),MAIL_ID_ACCESS_ENABLED:'true'}});
+    child=spawn(binary,[],{cwd:resolve(import.meta.dirname,'..'),stdio:['ignore','pipe','pipe'],env:{...process.env,MAIL_BASE_URL:appOrigin,MAIL_ADDR:`127.0.0.1:${appPort}`,MAIL_POSTGRES_URI:process.env.MAIL_TEST_POSTGRES_URI,MAIL_ENCRYPTION_KEY:randomBytes(32).toString('base64'),MAIL_ID_ISSUER:base,MAIL_ID_CLIENT_ID:created.app.id,MAIL_ID_CLIENT_SECRET:created.client_secret,MAIL_ID_COOKIE_KEY:randomBytes(32).toString('base64'),MAIL_ID_ACCESS_ENABLED:'true'}});
     // Retain no process output: no credentials or fixture setup links in reports.
     child.stdout.resume();child.stderr.resume();child.on('error',()=>{});
     let ready=false;const deadline=Date.now()+15000;
@@ -103,7 +103,7 @@ export async function lifecycle({browser,base,mail,setupCode,root,fixtureSql}) {
     await block('block');assert.equal((await api('/api/me')).status(),403);
     assert.equal((await signed.ctx.request.post(appOrigin+'/api/auth/id/logout',{headers:{Origin:appOrigin},maxRedirects:0,timeout:5000})).status(),303);assert.equal((await api('/api/me')).status(),401);
     assert.equal((await signed.ctx.request.get(base+'/account',{maxRedirects:0,timeout:5000})).status(),200,'app logout removed global ID device');
-    const report={scope:'Owned actual Identity + Mail binaries, native PostgreSQL and Mongo, captured verified invitations and explicit reviewed policy',callback:'pass',local_restriction:'pass',callback_replay:'denied',cookie_mcp_oauth_refresh:'pass',removal_and_real_policy_storage_outage:'fail closed',refresh_restoration:'pass',blocked_cookie_logout:'pass',global_device_preserved:true,mailbox_network:'not used; separately covered with owned simulated IMAP/SMTP transports'};
+    const report={scope:'Owned actual Identity + Mail binaries, native PostgreSQL, captured verified invitations and explicit reviewed policy',callback:'pass',local_restriction:'pass',callback_replay:'denied',cookie_mcp_oauth_refresh:'pass',removal_and_real_policy_storage_outage:'fail closed',refresh_restoration:'pass',blocked_cookie_logout:'pass',global_device_preserved:true,mailbox_network:'not used; separately covered with owned simulated IMAP/SMTP transports'};
     if(process.env.MAIL_ID_REHEARSAL_REPORT)await writeFile(process.env.MAIL_ID_REHEARSAL_REPORT,JSON.stringify(report,null,2)+'\n',{mode:0o600});
     console.log('Mail real Identity: verified callback, local restriction, replay, browser/OAuth/MCP, removal, real ID storage outage, refresh restoration and blocked-cookie logout passed');
   } finally {

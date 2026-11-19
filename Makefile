@@ -17,15 +17,15 @@ test:
 	go test -race ./...
 
 access-check:
-	bash scripts/test-owned-mongo.sh go test -race ./...
+	go test -race ./...
 
 access-rehearsal:
-	MAIL_ACCESS_REHEARSAL=1 bash scripts/test-owned-mongo.sh go test -race ./internal/components/mailsync -run '^TestAccessActiveWorkRehearsal$$' -count=1 -v
+	MAIL_ACCESS_REHEARSAL=1 go test -race ./internal/components/mailsync -run '^TestAccessActiveWorkRehearsal$$' -count=1 -v
 
 # Requires the sibling Identity debug binary and its installed e2e dependencies.
 identity-provider-check:
 	CGO_ENABLED=0 go build -o mail-server ./cmd/mail
-	bash scripts/test-owned-mongo.sh bash -c 'cd ../identity && ID_E2E_SCENARIO=../mcp-icloud-email/e2e/identity-provider-scenario.mjs node e2e/run.mjs'
+	bash -c 'cd ../identity && ID_E2E_SCENARIO=../mail/e2e/identity-provider-scenario.mjs node e2e/run.mjs'
 
 vet:
 	go vet ./...

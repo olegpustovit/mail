@@ -18,7 +18,7 @@ import (
 	"github.com/emersion/go-imap/client"
 	message "github.com/emersion/go-message/mail"
 	"github.com/google/uuid"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmessage"
+	"github.com/olegpustovit/mail/internal/mailmessage"
 )
 
 const (

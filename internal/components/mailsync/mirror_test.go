@@ -3,41 +3,53 @@ package mailsync
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	imapv2 "github.com/emersion/go-imap/v2"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/pg/pgtest"
 )
 
 func testMirror(t *testing.T) *Service {
 	t.Helper()
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
-	s, err := newService(context.Background(), uri, base64.StdEncoding.EncodeToString(make([]byte, 32)), func(context.Context, string) (string, string, error) {
+	dsn, schema := pgtest.New(t)
+	s, err := newService(context.Background(), dsn, base64.StdEncoding.EncodeToString(make([]byte, 32)), func(context.Context, string) (string, string, error) {
 		return "mirror@icloud.com", "test-password", nil
-	}, "mail_sync_test_"+auth.Random())
+	}, schema)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		s.cancel()
 		s.wg.Wait()
-		_ = s.db.Drop(context.Background())
 		if err := s.Close(context.Background()); err != nil {
 			t.Error(err)
 		}
 	})
 	return s
+}
+
+// seedMessage writes a mirror row directly, bypassing the journal.
+func seedMessage(s *Service, m Metadata) error {
+	raw, err := json.Marshal(toMetaDoc(m))
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(context.Background(), upsertMessage, m.Key, m.Owner, m.Account, m.Folder, m.ID, int64(m.UIDValidity), m.Flags, m.Date, m.ThreadID, m.MessageID, m.SubjectKey, m.BodyCached, raw)
+	return err
+}
+
+// countMessages counts mirror rows matching a SQL condition.
+func countMessages(s *Service, where string, args ...any) int {
+	var n int
+	_ = s.pool.QueryRow(context.Background(), "SELECT count(*) FROM mail_messages WHERE "+where, args...).Scan(&n)
+	return n
 }
 
 type syncFake struct {
@@ -119,7 +131,7 @@ func TestReconcileRejectsGenerationChangeAndRemovesDeletedFolders(t *testing.T) 
 	if err := s.reconcileFolder(m, f, "INBOX", false, "imap", ""); err == nil {
 		t.Fatal("committed FETCH across a UIDVALIDITY reset")
 	}
-	count, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": m.owner})
+	count := countMessages(s, "owner = $1", m.owner)
 	if count != 0 {
 		t.Fatal("mixed mailbox generations were persisted")
 	}
@@ -130,7 +142,7 @@ func TestReconcileRejectsGenerationChangeAndRemovesDeletedFolders(t *testing.T) 
 	if err := s.refreshFolders(m, f, refreshRequest{actor: "web"}); err != nil {
 		t.Fatal(err)
 	}
-	count, _ = s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": m.owner})
+	count = countMessages(s, "owner = $1", m.owner)
 	boxes, err := s.Folders(ctx, m.owner, m.account)
 	if err != nil || count != 0 || len(boxes) != 0 || len(m.order) != 0 || len(m.folders) != 0 {
 		t.Fatalf("deleted folder survived: messages=%d folders=%d err=%v", count, len(boxes), err)
@@ -214,8 +226,7 @@ func TestMirrorImportDeltaExpungeAndUIDReset(t *testing.T) {
 		fake.modseq = 2
 	})
 	eventually(t, func() bool {
-		var m Metadata
-		err := s.db.Collection("mail_messages").FindOne(ctx, bson.M{"_id": messageKey(owner, account, "INBOX", 7, "650")}).Decode(&m)
+		m, err := s.messageByKey(ctx, owner, account, messageKey(owner, account, "INBOX", 7, "650"))
 		return err == nil && m.FlagColor == "blue"
 	})
 	var changes []Change
@@ -275,9 +286,9 @@ func TestMirrorImportDeltaExpungeAndUIDReset(t *testing.T) {
 		fake.modseq = 4
 	})
 	eventually(t, func() bool {
-		old, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"_id": messageKey(owner, account, "INBOX", 7, "1")})
-		fresh, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"_id": messageKey(owner, account, "INBOX", 7, "900")})
-		count, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner})
+		old := countMessages(s, "key = $1", messageKey(owner, account, "INBOX", 7, "1"))
+		fresh := countMessages(s, "key = $1", messageKey(owner, account, "INBOX", 7, "900"))
+		count := countMessages(s, "owner = $1", owner)
 		return old == 0 && fresh == 1 && count == 650
 	})
 	fake.change(func() {
@@ -287,8 +298,8 @@ func TestMirrorImportDeltaExpungeAndUIDReset(t *testing.T) {
 		fake.mail = map[uint32]imap.Email{1: {ID: "1", Subject: "A different message after reset", MessageID: "reset@example.com", Date: time.Now(), ModSeq: 1}}
 	})
 	eventually(t, func() bool {
-		count, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner})
-		fresh, _ := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"_id": messageKey(owner, account, "INBOX", 88, "1")})
+		count := countMessages(s, "owner = $1", owner)
+		fresh := countMessages(s, "key = $1", messageKey(owner, account, "INBOX", 88, "1"))
 		return count == 1 && fresh == 1
 	})
 	_, _, other, _, err := s.Bootstrap(ctx, "other@olegpustovit.com", account)
@@ -318,9 +329,8 @@ func TestReconcileVanishedDeletesUIDRange(t *testing.T) {
 	if err := s.reconcileVanished(m, fake, imap.SyncEvent{Kind: "vanished", Folder: "INBOX", UIDs: vanished, Earlier: true}, "imap"); err != nil {
 		t.Fatal(err)
 	}
-	count, err := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner, "account": account})
-	if err != nil || count != 0 {
-		t.Fatalf("remaining messages=%d err=%v, want 0", count, err)
+	if count := countMessages(s, "owner = $1 AND account = $2", owner, account); count != 0 {
+		t.Fatalf("remaining messages=%d, want 0", count)
 	}
 }
 
@@ -347,8 +357,8 @@ func TestTimedOutFetchReconnectsAndCompletesImport(t *testing.T) {
 	if attempts < 2 {
 		t.Fatalf("sync connections=%d, want reconnect after FETCH deadline", attempts)
 	}
-	if count, err := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner, "account": account}); err != nil || count != 1 {
-		t.Fatalf("mirrored messages=%d err=%v, want 1", count, err)
+	if count := countMessages(s, "owner = $1 AND account = $2", owner, account); count != 1 {
+		t.Fatalf("mirrored messages=%d, want 1", count)
 	}
 }
 
@@ -407,8 +417,7 @@ func TestTransportDropReconnectsWithoutServiceRestart(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		count, err := s.db.Collection("mail_messages").CountDocuments(ctx, bson.M{"owner": owner, "account": account})
-		if err == nil && count == 2 {
+		if countMessages(s, "owner = $1 AND account = $2", owner, account) == 2 {
 			status, err := s.Status(ctx, owner, account)
 			if err == nil && status.Phase == "live" {
 				return
@@ -456,7 +465,8 @@ func TestJournalRecoveryAndThreading(t *testing.T) {
 	}
 	cursor, _ := s.Cursor(ctx, owner, account)
 	crash := Change{ID: identity(owner, "crash"), Owner: owner, Account: account, Sequence: cursor + 1, Entity: "msg", Op: "put", Key: prepared[0].Key, Message: &prepared[0], Actor: "web", At: time.Now(), Committed: false}
-	if _, err = s.db.Collection("mail_changelog").InsertOne(ctx, crash); err != nil {
+	raw, _ := json.Marshal(changeDoc{Message: toMetaDoc(prepared[0])})
+	if _, err = s.pool.Exec(ctx, `INSERT INTO mail_changelog (id, owner, account, seq, entity, op, key, actor, at, committed, data) VALUES ($1, $2, $3, $4, 'msg', 'put', $5, 'web', now(), false, $6)`, crash.ID, owner, account, crash.Sequence, crash.Key, raw); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.recoverOwner(ctx, owner); err != nil {
@@ -465,14 +475,14 @@ func TestJournalRecoveryAndThreading(t *testing.T) {
 	if err = s.recoverOwner(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	var recovered Change
-	if err = s.db.Collection("mail_changelog").FindOne(ctx, bson.M{"_id": crash.ID}).Decode(&recovered); err != nil || !recovered.Committed {
+	var committed bool
+	if err = s.pool.QueryRow(ctx, `SELECT committed FROM mail_changelog WHERE id = $1`, crash.ID).Scan(&committed); err != nil || !committed {
 		t.Fatal("unfinished journal entry was not recovered")
 	}
 	if leaked, err := s.Changes(ctx, "another-owner", account, 0); err != nil || len(leaked) != 0 {
 		t.Fatal("changelog leaked another owner's changes")
 	}
-	if _, err = searchConditions(`from:sender has:attachment after:not-a-date`); err == nil {
+	if err = searchConditions(&filter{}, `from:sender has:attachment after:not-a-date`); err == nil {
 		t.Fatal("accepted malformed search date")
 	}
 }

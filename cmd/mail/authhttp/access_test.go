@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/auth"
 )
 
 func TestAccessFreshCallbackRecordsRefreshDenialAndRecovery(t *testing.T) {

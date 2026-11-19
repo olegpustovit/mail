@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func waitRule(t *testing.T, condition func() bool) {
@@ -125,7 +124,8 @@ func TestArrivalRulesDurableActionsAndIdempotentForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRule(t, func() bool {
-		n, _ := s.db.Collection("mail_rule_jobs").CountDocuments(ctx, bson.M{"owner": "owner", "state": "done"})
+		var n int
+		_ = s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_rule_jobs WHERE owner=$1 AND state='done'", "owner").Scan(&n)
 		return n == 1
 	})
 	f.mu.Lock()
@@ -140,8 +140,8 @@ func TestArrivalRulesDurableActionsAndIdempotentForward(t *testing.T) {
 	if err != nil || len(jobs) != 1 || !jobs[0].Message.Automated || jobs[0].Actor != "rule" || jobs[0].Message.Body == "" {
 		t.Fatal("forward not durably queued", jobs, err)
 	}
-	var stored RuleJob
-	if err = s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"state": "done"}).Decode(&stored); err != nil {
+	stored, err := s.loadRuleJob(ctx, "state='done'")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err = s.ruleForward(ctx, stored, stored.Actions[0]); err != nil {
@@ -167,8 +167,7 @@ func TestArrivalRulesDurableActionsAndIdempotentForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRule(t, func() bool {
-		var record RuleApplication
-		e := s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"_id": application.ID}).Decode(&record)
+		record, e := s.loadRuleApplication(ctx, "id=$1", application.ID)
 		return e == nil && record.State == "done" && record.Matched == 1
 	})
 	waitRule(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.mail["INBOX"]) == 0 })
@@ -213,21 +212,22 @@ func TestRuleApplyPagesAndJournalRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var applied RuleApplication
-	if err = s.db.Collection("mail_rule_applications").FindOne(ctx, bson.M{"_id": application.ID}).Decode(&applied); err != nil || applied.State != "done" || applied.Scanned != 501 || applied.Matched != 501 {
+	applied, err := s.loadRuleApplication(ctx, "id=$1", application.ID)
+	if err != nil || applied.State != "done" || applied.Scanned != 501 || applied.Matched != 501 {
 		t.Fatal(applied, err)
 	}
-	count, err := s.db.Collection("mail_rule_jobs").CountDocuments(ctx, bson.M{"owner": owner})
+	var count int
+	err = s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_rule_jobs WHERE owner=$1", owner).Scan(&count)
 	if err != nil || count != 501 {
 		t.Fatal("page skipped jobs", count, err)
 	}
-	var job RuleJob
-	if err = s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"owner": owner}).Decode(&job); err != nil {
+	job, err := s.loadRuleJob(ctx, "owner=$1", owner)
+	if err != nil {
 		t.Fatal(err)
 	}
 	job.Step = 1
 	job.State = "done"
-	if _, err = s.db.Collection("mail_rule_jobs").ReplaceOne(ctx, bson.M{"_id": job.ID}, job); err != nil {
+	if _, err = s.pool.Exec(ctx, "UPDATE mail_rule_jobs SET step=$2, state=$3 WHERE id=$1", job.ID, job.Step, job.State); err != nil {
 		t.Fatal(err)
 	}
 	job.State = "pending"
@@ -236,8 +236,8 @@ func TestRuleApplyPagesAndJournalRecovery(t *testing.T) {
 	if err = s.applyChanges(ctx, []Change{entry}); err != nil {
 		t.Fatal(err)
 	}
-	var replay RuleJob
-	if err = s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"_id": job.ID}).Decode(&replay); err != nil || replay.State != "done" || replay.Step != 1 {
+	replay, err := s.loadRuleJob(ctx, "id=$1", job.ID)
+	if err != nil || replay.State != "done" || replay.Step != 1 {
 		t.Fatal("journal replay reset completed action", replay, err)
 	}
 	entry.Owner = "foreign"
@@ -269,8 +269,8 @@ func TestDisabledRulesConsumeOldJobsWithoutApplying(t *testing.T) {
 	if err := s.advanceRule(ctx, *job); err != nil {
 		t.Fatal("disabled rule attempted an IMAP connection", err)
 	}
-	var stored RuleJob
-	if err := s.db.Collection("mail_rule_jobs").FindOne(ctx, bson.M{"_id": job.ID}).Decode(&stored); err != nil || stored.State != "done" || stored.Step != 3 {
+	stored, err := s.loadRuleJob(ctx, "id=$1", job.ID)
+	if err != nil || stored.State != "done" || stored.Step != 3 {
 		t.Fatal("disabled work remained pending", stored, err)
 	}
 }

@@ -13,8 +13,7 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
 )
 
 func pushFixture(t *testing.T) PushRegistration {
@@ -142,9 +141,11 @@ func TestPushPersistenceRetriesRevocationAndAccountIsolation(t *testing.T) {
 		if err := s.pushDevice(ctx, d, valid, "https://mail.example.com", client); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.db.Collection("mail_push_devices").FindOne(ctx, bson.M{"_id": d.ID}).Decode(&d); err != nil {
-			t.Fatal(err)
+		devices, err := s.queryPush(ctx, "SELECT "+pushCols+" FROM mail_push_devices WHERE id = $1", d.ID)
+		if err != nil || len(devices) != 1 {
+			t.Fatal("device missing", err)
 		}
+		d = devices[0]
 	}
 	original := d.Cursor
 	run()
@@ -187,7 +188,7 @@ func TestPushPersistenceRetriesRevocationAndAccountIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int64
-	count, err = s.db.Collection("mail_push_devices").CountDocuments(ctx, bson.M{"_id": d.ID})
+	err = s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_push_devices WHERE id = $1", d.ID).Scan(&count)
 	if err != nil || count != 0 {
 		t.Fatal("old account retained notifications", err)
 	}
@@ -202,7 +203,8 @@ func TestArrivalExcludesInitialImportAndMailboxReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	count := func() int64 {
-		n, err := s.db.Collection("mail_changelog").CountDocuments(ctx, bson.M{"arrival": true})
+		var n int64
+		err := s.pool.QueryRow(ctx, "SELECT count(*) FROM mail_changelog WHERE (data->>'arrival')::boolean").Scan(&n)
 		if err != nil {
 			t.Fatal(err)
 		}

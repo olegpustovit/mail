@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 func TestSentCopyFailureRemainsSuccessfulForBothTools(t *testing.T) {

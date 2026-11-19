@@ -9,45 +9,44 @@ import (
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 type Identity struct {
-	Address   string `json:"address" bson:"address"`
-	Name      string `json:"name" bson:"name"`
-	Signature string `json:"signature" bson:"signature"`
+	Address   string `json:"address"`
+	Name      string `json:"name"`
+	Signature string `json:"signature"`
 }
 type Rule struct {
-	ID         string          `json:"id" bson:"id"`
-	Field      string          `json:"field" bson:"field"`
-	Match      string          `json:"match" bson:"match"`
-	Value      string          `json:"value" bson:"value"`
-	Action     string          `json:"action" bson:"action"`
-	Target     string          `json:"target" bson:"target"`
-	Enabled    bool            `json:"enabled" bson:"enabled"`
-	Conditions []RuleCondition `json:"conditions,omitempty" bson:"conditions,omitempty"`
-	Actions    []RuleAction    `json:"actions,omitempty" bson:"actions,omitempty"`
+	ID         string          `json:"id"`
+	Field      string          `json:"field"`
+	Match      string          `json:"match"`
+	Value      string          `json:"value"`
+	Action     string          `json:"action"`
+	Target     string          `json:"target"`
+	Enabled    bool            `json:"enabled"`
+	Conditions []RuleCondition `json:"conditions,omitempty"`
+	Actions    []RuleAction    `json:"actions,omitempty"`
 }
 type Preferences struct {
-	Theme          string            `json:"theme" bson:"theme"`
-	Signal         bool              `json:"signal" bson:"signal"`
-	Density        string            `json:"density" bson:"density"`
-	ReadingFont    string            `json:"readingFont" bson:"reading_font"`
-	Motion         string            `json:"motion" bson:"motion"`
-	KeyPreset      string            `json:"keyPreset" bson:"key_preset"`
-	Keymap         map[string]string `json:"keymap" bson:"keymap"`
-	Notifications  string            `json:"notifications" bson:"notifications"`
-	QuietHours     bool              `json:"quietHours" bson:"quiet_hours"`
-	QuietStart     string            `json:"quietStart" bson:"quiet_start"`
-	QuietEnd       string            `json:"quietEnd" bson:"quiet_end"`
-	UndoSeconds    int               `json:"undoSeconds" bson:"undo_seconds"`
-	RemoteContent  string            `json:"remoteContent" bson:"remote_content"`
-	AllowedSenders []string          `json:"allowedSenders" bson:"allowed_senders"`
-	StripTracking  bool              `json:"stripTracking" bson:"strip_tracking"`
-	VIP            []string          `json:"vip" bson:"vip"`
-	Identities     []Identity        `json:"identities" bson:"identities"`
-	Rules          []Rule            `json:"rules" bson:"rules"`
+	Theme          string            `json:"theme"`
+	Signal         bool              `json:"signal"`
+	Density        string            `json:"density"`
+	ReadingFont    string            `json:"readingFont"`
+	Motion         string            `json:"motion"`
+	KeyPreset      string            `json:"keyPreset"`
+	Keymap         map[string]string `json:"keymap"`
+	Notifications  string            `json:"notifications"`
+	QuietHours     bool              `json:"quietHours"`
+	QuietStart     string            `json:"quietStart"`
+	QuietEnd       string            `json:"quietEnd"`
+	UndoSeconds    int               `json:"undoSeconds"`
+	RemoteContent  string            `json:"remoteContent"`
+	AllowedSenders []string          `json:"allowedSenders"`
+	StripTracking  bool              `json:"stripTracking"`
+	VIP            []string          `json:"vip"`
+	Identities     []Identity        `json:"identities"`
+	Rules          []Rule            `json:"rules"`
 }
 
 func defaultPreferences() Preferences {
@@ -55,8 +54,9 @@ func defaultPreferences() Preferences {
 }
 func (s *Service) Preferences(ctx context.Context, owner string) (Preferences, error) {
 	p := defaultPreferences()
-	err := s.db.Collection("mail_preferences").FindOne(ctx, bson.M{"_id": owner}).Decode(&p)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	// Unmarshalling over the defaults keeps them for fields the stored document lacks.
+	err := s.pool.QueryRow(ctx, "SELECT data FROM mail_preferences WHERE id = $1", owner).Scan(&p)
+	if errors.Is(err, pg.ErrNoRows) {
 		return p, nil
 	}
 	return p, err

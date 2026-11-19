@@ -15,13 +15,13 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/cmd/mail/authhttp"
-	"github.com/olegpustovit/mcp-icloud-email/cmd/mail/mailhttp"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
-	"github.com/olegpustovit/mcp-icloud-email/internal/httpcancel"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
-	"github.com/olegpustovit/mcp-icloud-email/web"
+	"github.com/olegpustovit/mail/cmd/mail/authhttp"
+	"github.com/olegpustovit/mail/cmd/mail/mailhttp"
+	"github.com/olegpustovit/mail/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
+	"github.com/olegpustovit/mail/internal/httpcancel"
+	"github.com/olegpustovit/mail/internal/mailmcp"
+	"github.com/olegpustovit/mail/web"
 )
 
 var version = "dev"
@@ -58,7 +58,7 @@ func run() error {
 	if err = service.EnableAccess(identity); err != nil {
 		return err
 	}
-	syncService, err := mailsync.New(ctx, cfg.MongoURI, cfg.EncryptionKey, service.Credentials, service.WatchAccess)
+	syncService, err := mailsync.New(ctx, cfg.PostgresURI, cfg.EncryptionKey, service.Credentials, service.WatchAccess)
 	if err != nil {
 		return err
 	}

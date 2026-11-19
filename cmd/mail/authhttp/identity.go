@@ -8,7 +8,7 @@ import (
 
 	idclient "github.com/olegpustovit/identity/idclient-go"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/auth"
+	"github.com/olegpustovit/mail/internal/components/auth"
 )
 
 const sessionCookie = "__Host-mail_session"

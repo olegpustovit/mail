@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/internal/pg/pgtest"
 )
 
 func TestPreferenceValidation(t *testing.T) {
@@ -70,22 +69,16 @@ func TestOutboxRemainsBoundToLinkedAccount(t *testing.T) {
 	}
 }
 func TestPersistentOutboxAndOwnerIsolation(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
+	dsn, schema := pgtest.New(t)
 	ctx := context.Background()
-	s, err := New(ctx, uri, base64.StdEncoding.EncodeToString(make([]byte, 32)), func(context.Context, string) (string, string, error) {
+	s, err := newService(ctx, dsn, base64.StdEncoding.EncodeToString(make([]byte, 32)), func(context.Context, string) (string, string, error) {
 		return "test@icloud.com", "password", nil
-	})
+	}, schema)
 	if err != nil {
 		t.Fatal(err)
 	}
 	owner := "outbox-test-" + time.Now().Format("150405.000000000")
 	defer func() {
-		for _, collection := range []string{"mail_outbox", "mail_preferences"} {
-			_, _ = s.db.Collection(collection).DeleteMany(ctx, bson.M{"$or": []bson.M{{"owner": owner}, {"_id": owner}}})
-		}
 		if err := s.Close(ctx); err != nil {
 			t.Error(err)
 		}

@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"github.com/olegpustovit/mcp-icloud-email/tools"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/mailmcp"
+	"github.com/olegpustovit/mail/smtp"
+	"github.com/olegpustovit/mail/tools"
 )
 
 type mailboxFake struct {

@@ -1,6 +1,6 @@
 # iCloud Mail MCP
 
-Terminal Mail is a multiuser iCloud web client and MCP server, with Microapps ID sign-in and MongoDB persistence. The web client includes conversations, offline triage, drafts, scheduled sends, snooze, rules, private image loading, and attributed agent activity. Fork of [roygabriel/mcp-icloud-email](https://github.com/roygabriel/mcp-icloud-email).
+Terminal Mail is a multiuser iCloud web client and MCP server, with Microapps ID sign-in and PostgreSQL persistence. The web client includes conversations, offline triage, drafts, scheduled sends, snooze, rules, private image loading, and attributed agent activity. Fork of [roygabriel/mcp-icloud-email](https://github.com/roygabriel/mcp-icloud-email).
 
 ## Hosted use
 
@@ -12,7 +12,7 @@ Each client grant permits reading, sending, and organizing your connected mailbo
 
 ## Run the hosted server
 
-Requires Go 1.26.11+, Node 22.13+, MongoDB, and a Microapps ID app registration (see below). The Microapps ID Go client is a private module: set `GOPRIVATE=github.com/olegpustovit/identity` and authenticated Git access (for example `git config --global url."https://x-access-token:$TOKEN@github.com/".insteadOf https://github.com/`). CI uses the `IDENTITY_READ_TOKEN` secret; Docker builds take `--secret id=github_token,src=<file>`.
+Requires Go 1.26.11+, Node 22.13+, PostgreSQL, and a Microapps ID app registration (see below). The Microapps ID Go client is a private module: set `GOPRIVATE=github.com/olegpustovit/identity` and authenticated Git access (for example `git config --global url."https://x-access-token:$TOKEN@github.com/".insteadOf https://github.com/`). CI uses the `IDENTITY_READ_TOKEN` secret; Docker builds take `--secret id=github_token,src=<file>`.
 
 ```sh
 cp .env.example .env
@@ -27,7 +27,7 @@ make server
 | --- | --- |
 | `MAIL_BASE_URL` | Public HTTPS origin, without trailing slash |
 | `MAIL_ADDR` | Listen address; defaults to `127.0.0.1:4290` |
-| `MAIL_MONGODB_URI` | MongoDB URI; application database is `mail` |
+| `MAIL_POSTGRES_URI` | PostgreSQL URI; application database is `mail` |
 | `MAIL_ENCRYPTION_KEY` | Base64 encoding of 32 random bytes; generate once with `openssl rand -base64 32` |
 | `MAIL_ID_ISSUER` | Microapps ID issuer; defaults to `https://id.microapps.space` |
 | `MAIL_ID_CLIENT_ID` | Client ID of the Mail app registered in Microapps ID (required) |
@@ -37,7 +37,7 @@ make server
 
 The server refuses to start without a valid Microapps ID configuration, and performs provider discovery at startup. Register the app in Microapps ID with the exact redirect URI `https://mail.microapps.space/api/auth/id/callback`. Sign-in uses `GET /api/auth/id/login`, `GET /api/auth/id/callback` and `POST /api/auth/id/logout`; the retired local routes (`POST /auth/login`, `/auth/register`, `/auth/resend`, `/auth/forgot`, `/auth/reset`, `GET /auth/verify`) answer 403 `{"code":"identity_required","error":"Sign in with Microapps ID."}`. The session cookie is `__Host-mail_session`.
 
-The old `users` collection (password hashes) is no longer read; it stays in MongoDB only as rollback material. Linked Microapps ID subjects are stored in `identities` (unique subject and unique email).
+The old `users` collection (password hashes) is no longer read; it is not migrated. Linked Microapps ID subjects are stored in `identities` (unique subject and unique email).
 
 Keep the encryption key backed up separately with your database backup. Replacing or losing it makes stored iCloud credentials unreadable. Secrets belong in private service environment files, never in Git.
 
@@ -49,11 +49,11 @@ curl https://mail.microapps.space/healthz
 curl https://mail.microapps.space/healthz/sync
 ```
 
-Docker builds the React assets and hosted Go binary. Publish port 4290 and supply the same `MAIL_*` variables. Health is available at `/healthz`; MongoDB is checked at startup.
+Docker builds the React assets and hosted Go binary. Publish port 4290 and supply the same `MAIL_*` variables. Health is available at `/healthz`; PostgreSQL is checked at startup.
 
 ## Mail synchronization and offline storage
 
-The server keeps an owner/account-scoped metadata mirror in MongoDB. One IMAP connection follows Inbox changes with IDLE; separate command connections handle browser actions and background/MCP work so prefetching does not delay opening mail. Other folders are checked every 30 seconds while a browser stream or recent MCP call is active, and every ten minutes otherwise. Servers without IDLE use polling. Folder UIDVALIDITY changes reset that folder's replica.
+The server keeps an owner/account-scoped metadata mirror in PostgreSQL. One IMAP connection follows Inbox changes with IDLE; separate command connections handle browser actions and background/MCP work so prefetching does not delay opening mail. Other folders are checked every 30 seconds while a browser stream or recent MCP call is active, and every ten minutes otherwise. Servers without IDLE use polling. Folder UIDVALIDITY changes reset that folder's replica.
 
 Browsers share a worker and an IndexedDB replica, with a dedicated-worker fallback. Downloaded bodies use a 200 MB LRU cache on the device. Queued changes survive reloads and are removed only after the server journal confirms them. Signing out or unlinking clears the device replica. Privacy settings can clear downloaded bodies separately. Metadata and its journal are readable to database administrators; scheduled message payloads and push subscription secrets are encrypted with the service encryption key.
 
@@ -88,14 +88,12 @@ npm run test:performance
 cd ..
 go test ./...
 go vet ./...
-# Include Mongo integration tests against a disposable test server:
-MAIL_TEST_MONGODB_URI=mongodb://127.0.0.1:27018 go test ./...
-# The auth service tests use disposable mail_test_* databases that they drop afterwards; never point the URI at production.
-# Start and clean an owned native loopback Mongo process for the full race suite:
+# Include Postgres integration tests; each test uses a private schema it drops afterwards. Never point the URI at production:
+MAIL_TEST_POSTGRES_URI=postgres://user:pass@127.0.0.1:5432/mail_test go test -race ./...
 make access-check
 # Actual 25-second cancellation intervals, published SDK, simulated mail/policy transports:
 make access-rehearsal
-# Actual sibling Identity and Mail binaries, owned PostgreSQL + Mongo, verified sign-in:
+# Actual sibling Identity and Mail binaries, owned PostgreSQL, verified sign-in:
 make identity-provider-check
 ```
 

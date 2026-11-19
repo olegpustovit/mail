@@ -6,8 +6,7 @@ import (
 	"time"
 
 	idclient "github.com/olegpustovit/identity/idclient-go"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 var ErrAccessDenied = errors.New("mail app access denied")
@@ -49,8 +48,8 @@ func (s *Service) Subject(ctx context.Context, owner string) (string, error) {
 		return "", ErrAccessDenied
 	}
 	var binding Identity
-	err := s.db.Collection("identities").FindOne(ctx, bson.M{"email": owner}).Decode(&binding)
-	if errors.Is(err, mongo.ErrNoDocuments) || err == nil && binding.Subject == "" {
+	err := s.pool.QueryRow(ctx, "SELECT subject, email, created FROM identities WHERE email=$1", owner).Scan(&binding.Subject, &binding.Email, &binding.Created)
+	if errors.Is(err, pg.ErrNoRows) || err == nil && binding.Subject == "" {
 		return "", ErrAccessDenied
 	}
 	if err != nil {

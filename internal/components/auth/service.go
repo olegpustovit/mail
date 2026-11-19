@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -16,41 +15,95 @@ import (
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
 
-// Database defaults to "mail"; only tests override it with a disposable name.
-type Config struct{ BaseURL, MongoURI, EncryptionKey, Database string }
+// Schema defaults to "public"; only tests override it with a disposable name.
+type Config struct{ BaseURL, PostgresURI, EncryptionKey, Schema string }
+
+const ddl = `
+CREATE TABLE IF NOT EXISTS auth (
+	id text PRIMARY KEY, subject text NOT NULL DEFAULT '', kind text NOT NULL DEFAULT '', email text NOT NULL DEFAULT '',
+	expires timestamptz, data text NOT NULL DEFAULT '', client_id text NOT NULL DEFAULT '', redirect text NOT NULL DEFAULT '',
+	challenge text NOT NULL DEFAULT '', resource text NOT NULL DEFAULT '', family text NOT NULL DEFAULT '',
+	created timestamptz, last_used timestamptz);
+CREATE INDEX IF NOT EXISTS auth_expires ON auth (expires);
+CREATE INDEX IF NOT EXISTS auth_email_kind ON auth (email, kind);
+CREATE INDEX IF NOT EXISTS auth_family ON auth (family) WHERE family <> '';
+CREATE TABLE IF NOT EXISTS accounts (email text PRIMARY KEY, icloud_email text NOT NULL DEFAULT '', secret bytea);
+CREATE TABLE IF NOT EXISTS identities (subject text PRIMARY KEY, email text NOT NULL UNIQUE, created timestamptz NOT NULL);`
+
+const recordCols = `id, subject, kind, email, expires, data, client_id, redirect, challenge, resource, family, created, last_used`
+
+func nz(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+func scanRecord(row pgx.Row) (Record, error) {
+	var r Record
+	var exp, created, used *time.Time
+	if err := row.Scan(&r.ID, &r.Subject, &r.Kind, &r.Email, &exp, &r.Data, &r.ClientID, &r.Redirect, &r.Challenge, &r.Resource, &r.Family, &created, &used); err != nil {
+		return r, err
+	}
+	for _, p := range []struct {
+		to   *time.Time
+		from *time.Time
+	}{{&r.Expires, exp}, {&r.Created, created}, {&r.LastUsed, used}} {
+		if p.from != nil {
+			*p.to = *p.from
+		}
+	}
+	return r, nil
+}
+func (s *Service) records(ctx context.Context, where string, args ...any) ([]Record, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+recordCols+" FROM auth WHERE "+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Record
+	for rows.Next() {
+		r, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 type Service struct {
 	Config Config
-	client *mongo.Client
-	db     *mongo.Database
+	pool   *pgxpool.Pool
+	stop   context.CancelFunc
 	cipher cipher.AEAD
 	access func(context.Context, string, bool) error
 }
 type Record struct {
-	Subject   string    `bson:"subject,omitempty" json:"-"`
-	ID        string    `bson:"_id"`
-	Kind      string    `bson:"kind"`
-	Email     string    `bson:"email,omitempty"`
-	Expires   time.Time `bson:"expires,omitempty"`
-	Data      string    `bson:"data,omitempty"`
-	ClientID  string    `bson:"client_id,omitempty"`
-	Redirect  string    `bson:"redirect,omitempty"`
-	Challenge string    `bson:"challenge,omitempty"`
-	Resource  string    `bson:"resource,omitempty"`
-	Family    string    `bson:"family,omitempty"`
-	Created   time.Time `bson:"created,omitempty"`
-	LastUsed  time.Time `bson:"last_used,omitempty"`
+	Subject   string `json:"-"`
+	ID        string
+	Kind      string
+	Email     string
+	Expires   time.Time
+	Data      string
+	ClientID  string
+	Redirect  string
+	Challenge string
+	Resource  string
+	Family    string
+	Created   time.Time
+	LastUsed  time.Time
 }
 type Account struct {
-	Email       string `bson:"_id"`
-	ICloudEmail string `bson:"icloud_email"`
-	Secret      []byte `bson:"secret" json:"-"`
+	Email       string
+	ICloudEmail string
+	Secret      []byte `json:"-"`
 }
 
 func Allowed(email string) bool {
@@ -77,9 +130,6 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if e != nil || u.Scheme != "https" || u.Host == "" || u.Path != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("MAIL_BASE_URL must be an HTTPS origin")
 	}
-	if c.MongoURI == "" {
-		return nil, errors.New("missing MongoDB configuration")
-	}
 	key, e := base64.StdEncoding.DecodeString(c.EncryptionKey)
 	if e != nil || len(key) != 32 {
 		return nil, errors.New("MAIL_ENCRYPTION_KEY must encode 32 bytes in base64")
@@ -92,48 +142,35 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if e != nil {
 		return nil, e
 	}
-	client, e := mongo.Connect(options.Client().ApplyURI(c.MongoURI).SetTimeout(10 * time.Second))
+	pool, e := pg.Open(ctx, c.PostgresURI, c.Schema)
 	if e != nil {
-		return nil, fmt.Errorf("connect MongoDB: %w", e)
-	}
-	if e = client.Ping(ctx, nil); e != nil {
-		_ = client.Disconnect(ctx)
-		return nil, fmt.Errorf("ping MongoDB: %w", e)
-	}
-	database := c.Database
-	if database == "" {
-		database = "mail"
-	}
-	s := &Service{Config: c, client: client, db: client.Database(database), cipher: a}
-	_, e = s.db.Collection("auth").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "expires", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)})
-	if e == nil {
-		_, e = s.db.Collection("identities").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)})
-	}
-	if e != nil {
-		_ = client.Disconnect(ctx)
 		return nil, e
 	}
-	return s, nil
+	if e = pg.Migrate(ctx, pool, ddl); e != nil {
+		pool.Close()
+		return nil, e
+	}
+	sweep, stop := context.WithCancel(context.Background())
+	pg.Sweep(sweep, pool, time.Minute, "DELETE FROM auth WHERE expires < now()")
+	return &Service{Config: c, pool: pool, stop: stop, cipher: a}, nil
 }
-func (s *Service) Close(ctx context.Context) error { return s.client.Disconnect(ctx) }
+func (s *Service) Close(context.Context) error { s.stop(); s.pool.Close(); return nil }
 
 func (s *Service) Put(ctx context.Context, r Record) error {
 	if r.Created.IsZero() {
 		r.Created = time.Now().UTC()
 	}
-	_, e := s.db.Collection("auth").InsertOne(ctx, r)
+	_, e := s.pool.Exec(ctx, "INSERT INTO auth ("+recordCols+") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+		r.ID, r.Subject, r.Kind, r.Email, nz(r.Expires), r.Data, r.ClientID, r.Redirect, r.Challenge, r.Resource, r.Family, nz(r.Created), nz(r.LastUsed))
 	return e
 }
 func (s *Service) Get(ctx context.Context, id, kind string, consume bool) (Record, error) {
-	var r Record
-	filter := bson.M{"_id": Hash(id), "kind": kind, "expires": bson.M{"$gt": time.Now()}}
-	var e error
+	q := "SELECT " + recordCols + " FROM auth WHERE id=$1 AND kind=$2 AND expires > now()"
 	if consume {
-		e = s.db.Collection("auth").FindOneAndDelete(ctx, filter).Decode(&r)
-	} else {
-		e = s.db.Collection("auth").FindOne(ctx, filter).Decode(&r)
+		q = "DELETE FROM auth WHERE id=$1 AND kind=$2 AND expires > now() RETURNING " + recordCols
 	}
-	if errors.Is(e, mongo.ErrNoDocuments) {
+	r, e := scanRecord(s.pool.QueryRow(ctx, q, Hash(id), kind))
+	if errors.Is(e, pg.ErrNoRows) {
 		return r, ErrUnauthorized
 	}
 	return r, e
@@ -149,17 +186,17 @@ func (s *Service) Revoke(ctx context.Context, token string) error {
 	if e != nil {
 		return e
 	}
-	_, e = s.db.Collection("auth").DeleteMany(ctx, bson.M{"family": r.Family})
+	_, e = s.pool.Exec(ctx, "DELETE FROM auth WHERE family=$1", r.Family)
 	return e
 }
 func (s *Service) Delete(ctx context.Context, token string) error {
-	_, e := s.db.Collection("auth").DeleteOne(ctx, bson.M{"_id": Hash(token)})
+	_, e := s.pool.Exec(ctx, "DELETE FROM auth WHERE id=$1", Hash(token))
 	return e
 }
 func (s *Service) Account(ctx context.Context, email string) (Account, error) {
 	var a Account
-	e := s.db.Collection("accounts").FindOne(ctx, bson.M{"_id": email}).Decode(&a)
-	if errors.Is(e, mongo.ErrNoDocuments) {
+	e := s.pool.QueryRow(ctx, "SELECT email, icloud_email, secret FROM accounts WHERE email=$1", email).Scan(&a.Email, &a.ICloudEmail, &a.Secret)
+	if errors.Is(e, pg.ErrNoRows) {
 		return a, nil
 	}
 	return a, e
@@ -170,11 +207,11 @@ func (s *Service) SaveAccount(ctx context.Context, email, icloud, password strin
 		return e
 	}
 	secret := s.cipher.Seal(nonce, nonce, []byte(password), []byte(email))
-	_, e := s.db.Collection("accounts").ReplaceOne(ctx, bson.M{"_id": email}, Account{email, icloud, secret}, options.Replace().SetUpsert(true))
+	_, e := s.pool.Exec(ctx, "INSERT INTO accounts (email, icloud_email, secret) VALUES ($1,$2,$3) ON CONFLICT (email) DO UPDATE SET icloud_email=EXCLUDED.icloud_email, secret=EXCLUDED.secret", email, icloud, secret)
 	return e
 }
 func (s *Service) DeleteAccount(ctx context.Context, email string) error {
-	_, e := s.db.Collection("accounts").DeleteOne(ctx, bson.M{"_id": email})
+	_, e := s.pool.Exec(ctx, "DELETE FROM accounts WHERE email=$1", email)
 	return e
 }
 func (s *Service) Credentials(ctx context.Context, email string) (string, string, error) {
@@ -194,24 +231,24 @@ func (s *Service) Credentials(ctx context.Context, email string) (string, string
 }
 
 func (s *Service) ConnectedOwners(ctx context.Context) ([]string, error) {
-	rows, err := s.db.Collection("accounts").Find(ctx, bson.M{"secret": bson.M{"$type": "binData"}}, options.Find().SetProjection(bson.M{"_id": 1}))
+	rows, err := s.pool.Query(ctx, "SELECT email FROM accounts WHERE secret IS NOT NULL AND length(secret) > 0")
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close(ctx) }()
-	var accounts []Account
-	if err = rows.All(ctx, &accounts); err != nil {
-		return nil, err
+	defer rows.Close()
+	var owners []string
+	for rows.Next() {
+		var owner string
+		if err = rows.Scan(&owner); err != nil {
+			return nil, err
+		}
+		owners = append(owners, owner)
 	}
-	owners := make([]string, len(accounts))
-	for i, account := range accounts {
-		owners[i] = account.Email
-	}
-	return owners, nil
+	return owners, rows.Err()
 }
 
 func ConfigFromEnv() Config {
-	return Config{BaseURL: strings.TrimRight(os.Getenv("MAIL_BASE_URL"), "/"), MongoURI: os.Getenv("MAIL_MONGODB_URI"), EncryptionKey: os.Getenv("MAIL_ENCRYPTION_KEY")}
+	return Config{BaseURL: strings.TrimRight(os.Getenv("MAIL_BASE_URL"), "/"), PostgresURI: os.Getenv("MAIL_POSTGRES_URI"), EncryptionKey: os.Getenv("MAIL_ENCRYPTION_KEY")}
 }
 func (s *Service) Authenticate(r *http.Request) (string, error) {
 	email, _, err := s.AuthenticateClient(r)
@@ -232,11 +269,11 @@ func (s *Service) AuthenticateClient(r *http.Request) (string, string, error) {
 	if err := s.CheckRecord(r.Context(), rec, false); err != nil {
 		return "", "", err
 	}
-	result, err := s.db.Collection("auth").UpdateOne(r.Context(), bson.M{"_id": rec.ID, "kind": "access"}, bson.M{"$set": bson.M{"last_used": time.Now().UTC()}})
+	result, err := s.pool.Exec(r.Context(), "UPDATE auth SET last_used=$2 WHERE id=$1 AND kind='access'", rec.ID, time.Now().UTC())
 	if err != nil {
 		return "", "", err
 	}
-	if result.MatchedCount == 0 {
+	if result.RowsAffected() == 0 {
 		return "", "", ErrUnauthorized
 	}
 	return rec.Email, "mcp:" + rec.ClientID, nil
@@ -244,9 +281,9 @@ func (s *Service) AuthenticateClient(r *http.Request) (string, string, error) {
 
 // Identity links one Microapps ID subject to the mailbox owner email.
 type Identity struct {
-	Subject string    `bson:"_id"`
-	Email   string    `bson:"email"`
-	Created time.Time `bson:"created"`
+	Subject string
+	Email   string
+	Created time.Time
 }
 
 // LinkIdentity maps a verified Microapps ID subject to a mailbox owner and returns that owner's email.
@@ -258,11 +295,10 @@ func (s *Service) LinkIdentity(ctx context.Context, subject, email string) (stri
 	if subject == "" || len(subject) > 256 || !Allowed(email) {
 		return "", ErrUnauthorized
 	}
-	coll := s.db.Collection("identities")
 	find := func() (string, error) {
 		var linked Identity
-		e := coll.FindOne(ctx, bson.M{"_id": subject}).Decode(&linked)
-		if errors.Is(e, mongo.ErrNoDocuments) {
+		e := s.pool.QueryRow(ctx, "SELECT subject, email, created FROM identities WHERE subject=$1", subject).Scan(&linked.Subject, &linked.Email, &linked.Created)
+		if errors.Is(e, pg.ErrNoRows) {
 			return "", ErrUnauthorized
 		}
 		if e != nil {
@@ -276,8 +312,8 @@ func (s *Service) LinkIdentity(ctx context.Context, subject, email string) (stri
 	if owner, e := find(); e == nil || !errors.Is(e, ErrUnauthorized) {
 		return owner, e
 	}
-	_, e := coll.InsertOne(ctx, Identity{Subject: subject, Email: email, Created: time.Now().UTC()})
-	if mongo.IsDuplicateKeyError(e) {
+	_, e := s.pool.Exec(ctx, "INSERT INTO identities (subject, email, created) VALUES ($1,$2,$3)", subject, email, time.Now().UTC())
+	if pg.IsUnique(e) {
 		// A concurrent first sign-in for the same subject converges; any other duplicate is a different subject owning this email.
 		return find()
 	}
@@ -330,7 +366,7 @@ func (s *Service) ResolveBoundIdentity(ctx context.Context, subject, email strin
 		return "", err
 	}
 	var linked Identity
-	if err := s.db.Collection("identities").FindOne(ctx, bson.M{"_id": subject}).Decode(&linked); err != nil {
+	if err := s.pool.QueryRow(ctx, "SELECT subject, email, created FROM identities WHERE subject=$1", subject).Scan(&linked.Subject, &linked.Email, &linked.Created); err != nil {
 		return "", ErrUnauthorized
 	}
 	if !Allowed(linked.Email) {

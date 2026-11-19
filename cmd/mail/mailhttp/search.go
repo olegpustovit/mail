@@ -4,8 +4,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
 )
 
 func (h *handler) search(w http.ResponseWriter, r *http.Request) {

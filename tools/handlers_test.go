@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	imappkg "github.com/olegpustovit/mcp-icloud-email/imap"
+	imappkg "github.com/olegpustovit/mail/imap"
 )
 
 // req builds a mcp.CallToolRequest with the given arguments.

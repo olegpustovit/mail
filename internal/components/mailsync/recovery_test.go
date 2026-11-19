@@ -7,9 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 type replyFailureMail struct{ *moveWire }
@@ -57,6 +56,15 @@ func TestOutboxReplyFailureIsReturnedBeforeDraftCleanup(t *testing.T) {
 	}
 }
 
+// insertOp seeds a folder operation row directly.
+func insertOp(s *Service, op folderOperation) error {
+	if op.Generations == nil {
+		op.Generations = map[string]uint32{}
+	}
+	_, err := s.pool.Exec(context.Background(), "INSERT INTO mail_folder_ops ("+opColumns+") VALUES ("+marks(1, 16)+")", op.fields()...)
+	return err
+}
+
 func TestUncertainRestoreRetainsReceiptAndRejectsActiveSends(t *testing.T) {
 	s := testMirror(t)
 	s.cancel()
@@ -70,7 +78,7 @@ func TestUncertainRestoreRetainsReceiptAndRejectsActiveSends(t *testing.T) {
 	if _, err = s.RestoreUncertain(ctx, "owner", job.ID); err == nil {
 		t.Fatal("restored an active send")
 	}
-	if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"status": "uncertain"}}); err != nil {
+	if _, err = s.pool.Exec(ctx, `UPDATE mail_outbox SET status = 'uncertain' WHERE id = $1`, job.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.RestoreUncertain(ctx, "foreign", job.ID); err == nil {
@@ -83,14 +91,14 @@ func TestUncertainRestoreRetainsReceiptAndRejectsActiveSends(t *testing.T) {
 	if _, err = s.RestoreUncertain(ctx, "owner", job.ID); err != nil {
 		t.Fatal("lost-response retry failed", err)
 	}
-	if _, err = s.db.Collection("mail_outbox").UpdateOne(ctx, bson.M{"_id": job.ID}, bson.M{"$set": bson.M{"payload_expires": time.Now().Add(-time.Hour)}}); err != nil {
+	if _, err = s.pool.Exec(ctx, `UPDATE mail_outbox SET payload_expires = now() - interval '1 hour' WHERE id = $1`, job.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.cleanOutbox(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var stored Outbox
-	if err = s.db.Collection("mail_outbox").FindOne(ctx, bson.M{"_id": job.ID}).Decode(&stored); err != nil || len(stored.Payload) != 0 || stored.Status != "restored" {
+	stored, err := scanOutbox(s.pool.QueryRow(ctx, "SELECT "+outboxCols+" FROM mail_outbox WHERE id = $1", job.ID))
+	if err != nil || len(stored.Payload) != 0 || stored.Status != "restored" {
 		t.Fatal("cleanup deleted receipt or retained payload", stored, err)
 	}
 	receipt, err := s.Schedule(ctx, "owner", message)
@@ -111,7 +119,7 @@ func TestRenameInspectorCancellationAndOwnerScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := folderOperation{ID: "rename-conflict", Owner: "owner", Account: "mirror@icloud.com", Actor: "web", Transaction: "conflict", FolderRename: FolderRename{From: "Clients", To: "Conflict", Delimiter: "/"}, Validity: 7, State: "pending", NextAttempt: time.Now().Add(time.Hour), Created: time.Now()}
-	if _, err := s.db.Collection("mail_folder_ops").InsertOne(ctx, op); err != nil {
+	if err := insertOp(s, op); err != nil {
 		t.Fatal(err)
 	}
 	operations, err := s.RenameOperations(ctx, "owner")
@@ -133,13 +141,13 @@ func TestRenameInspectorCancellationAndOwnerScope(t *testing.T) {
 	}
 	op.ID = "already-applied"
 	op.ReferencesUpdated = true
-	if _, err = s.db.Collection("mail_folder_ops").InsertOne(ctx, op); err != nil {
+	if err = insertOp(s, op); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.CancelRename(ctx, "owner", op.ID); err == nil {
 		t.Fatal("cancelled partially rewritten references")
 	}
-	if _, err = s.db.Collection("mail_folder_ops").UpdateOne(ctx, bson.M{"_id": op.ID}, bson.M{"$set": bson.M{"references_updated": false}}); err != nil {
+	if _, err = s.pool.Exec(ctx, `UPDATE mail_folder_ops SET references_updated = false WHERE id = $1`, op.ID); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()

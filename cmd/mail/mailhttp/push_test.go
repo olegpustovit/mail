@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
 )
 
 func TestPushAcceptsBrowserSubscriptionJSON(t *testing.T) {

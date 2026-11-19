@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 )
 
 // SearchEmailsHandler creates a handler for searching emails

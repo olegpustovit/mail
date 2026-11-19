@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 )
 
 type searchWire struct{ *moveWire }
@@ -74,7 +74,7 @@ func TestRemoteSearchPaginationRolesIdentityAndOwnerIsolation(t *testing.T) {
 		return true
 	})
 	foreign := Metadata{Key: messageKey("other", box.account, "Archive", 7, "1"), Owner: "other", Account: box.account, Email: imap.Email{ID: "1", Folder: "Archive", UIDValidity: 7, Subject: "Foreign subject", ThreadID: "foreign-thread"}}
-	if _, err = s.db.Collection("mail_messages").InsertOne(ctx, foreign); err != nil {
+	if err = seedMessage(s, foreign); err != nil {
 		t.Fatal(err)
 	}
 	seen := map[string]bool{}
@@ -151,7 +151,7 @@ func TestRemoteSearchPaginationRolesIdentityAndOwnerIsolation(t *testing.T) {
 	if _, err = s.RemoteSearch(ctx, "owner", "other@icloud.com", "needle", ""); err == nil {
 		t.Fatal("changed account was searched")
 	}
-	if _, err = s.db.Collection("mail_folder_ops").InsertOne(ctx, folderOperation{ID: "pending", Owner: "owner", Account: box.account, State: "pending", NextAttempt: time.Now().Add(time.Hour)}); err != nil {
+	if err = insertOp(s, folderOperation{ID: "pending", Owner: "owner", Account: box.account, State: "pending", NextAttempt: time.Now().Add(time.Hour), Created: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.RemoteSearch(ctx, "owner", box.account, "needle", ""); !errors.Is(err, ErrRenamePending) {

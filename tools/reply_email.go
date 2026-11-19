@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 // ReplyEmailHandler creates a handler for replying to emails

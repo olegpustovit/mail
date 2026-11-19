@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"github.com/olegpustovit/mail/internal/pg/pgtest"
 	"net/http/httptest"
-	"os"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -78,17 +78,13 @@ func TestAccessWatcherStopsIdleAndBlockedChecksAtProductionDeadlines(t *testing.
 	})
 }
 func TestAccessRecordsRequireStableBindingAndProtectCredentials(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("owned Mongo required")
-	}
+	uri, schema := pgtest.New(t)
 	ctx := t.Context()
-	s, err := New(ctx, Config{BaseURL: "https://mail.example.test", MongoURI: uri, Database: "mail_test_" + Random(), EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	s, err := New(ctx, Config{BaseURL: "https://mail.example.test", PostgresURI: uri, Schema: schema, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close(ctx)
-	defer s.db.Drop(ctx)
 	const owner = "eval-access@olegpustovit.com"
 	const sub = "usr_eval_mail"
 	if _, err = s.LinkIdentity(ctx, sub, owner); err != nil {

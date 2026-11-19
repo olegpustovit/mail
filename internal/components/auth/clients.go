@@ -7,8 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
+	"github.com/olegpustovit/mail/internal/pg"
 )
 
 type ClientGrant struct {
@@ -19,13 +18,8 @@ type ClientGrant struct {
 }
 
 func (s *Service) Clients(ctx context.Context, owner string) ([]ClientGrant, error) {
-	rows, err := s.db.Collection("auth").Find(ctx, bson.M{"email": owner, "kind": bson.M{"$in": []string{"access", "refresh"}}, "expires": bson.M{"$gt": time.Now()}})
+	records, err := s.records(ctx, "email=$1 AND kind IN ('access','refresh') AND expires > now()", owner)
 	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	var records []Record
-	if err = rows.All(ctx, &records); err != nil {
 		return nil, err
 	}
 	grants := map[string]ClientGrant{}
@@ -46,7 +40,7 @@ func (s *Service) Clients(ctx context.Context, owner string) ([]ClientGrant, err
 	result := make([]ClientGrant, 0, len(grants))
 	for _, grant := range grants {
 		var registration Record
-		if err = s.db.Collection("auth").FindOne(ctx, bson.M{"_id": Hash(grant.ID), "kind": "client"}).Decode(&registration); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		if err = s.pool.QueryRow(ctx, "SELECT data FROM auth WHERE id=$1 AND kind='client'", Hash(grant.ID)).Scan(&registration.Data); err != nil && !errors.Is(err, pg.ErrNoRows) {
 			return nil, err
 		}
 		var data struct {
@@ -63,7 +57,7 @@ func (s *Service) Clients(ctx context.Context, owner string) ([]ClientGrant, err
 	return result, nil
 }
 func (s *Service) RevokeClient(ctx context.Context, owner, id string) error {
-	_, err := s.db.Collection("auth").DeleteMany(ctx, bson.M{"email": owner, "client_id": id, "kind": bson.M{"$in": []string{"access", "refresh", "code"}}})
+	_, err := s.pool.Exec(ctx, "DELETE FROM auth WHERE email=$1 AND client_id=$2 AND kind IN ('access','refresh','code')", owner, id)
 	return err
 }
 
@@ -76,18 +70,14 @@ type BrowserSession struct {
 }
 
 func (s *Service) ActiveSession(ctx context.Context, owner, hash string) (bool, error) {
-	count, err := s.db.Collection("auth").CountDocuments(ctx, bson.M{"_id": hash, "kind": "session", "email": owner, "expires": bson.M{"$gt": time.Now()}})
+	var count int
+	err := s.pool.QueryRow(ctx, "SELECT count(*) FROM auth WHERE id=$1 AND kind='session' AND email=$2 AND expires > now()", hash, owner).Scan(&count)
 	return count == 1, err
 }
 
 func (s *Service) Sessions(ctx context.Context, owner, current string) ([]BrowserSession, error) {
-	rows, err := s.db.Collection("auth").Find(ctx, bson.M{"email": owner, "kind": "session", "expires": bson.M{"$gt": time.Now()}})
+	records, err := s.records(ctx, "email=$1 AND kind='session' AND expires > now()", owner)
 	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close(ctx) }()
-	var records []Record
-	if err = rows.All(ctx, &records); err != nil {
 		return nil, err
 	}
 	result := make([]BrowserSession, 0, len(records))
@@ -97,6 +87,6 @@ func (s *Service) Sessions(ctx context.Context, owner, current string) ([]Browse
 	return result, nil
 }
 func (s *Service) RevokeOtherSessions(ctx context.Context, owner, current string) error {
-	_, err := s.db.Collection("auth").DeleteMany(ctx, bson.M{"email": owner, "kind": "session", "_id": bson.M{"$ne": Hash(current)}})
+	_, err := s.pool.Exec(ctx, "DELETE FROM auth WHERE email=$1 AND kind='session' AND id <> $2", owner, Hash(current))
 	return err
 }

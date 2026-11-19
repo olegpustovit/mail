@@ -5,9 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/internal/pg/pgtest"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 )
@@ -22,20 +21,15 @@ func TestAllowed(t *testing.T) {
 		}
 	}
 }
-func TestMongoCredentialIsolationAndTokens(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
+func TestCredentialIsolationAndTokens(t *testing.T) {
+	uri, schema := pgtest.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", MongoURI: uri, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", PostgresURI: uri, Schema: schema, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer s.Close(ctx)
-	s.db = s.client.Database("mail_test_" + Random())
-	defer s.db.Drop(ctx)
 	if e = s.SaveAccount(ctx, "one@olegpustovit.com", "one@icloud.com", "password-secret"); e != nil {
 		t.Fatal(e)
 	}
@@ -57,7 +51,7 @@ func TestMongoCredentialIsolationAndTokens(t *testing.T) {
 		t.Fatal("missing account accepted")
 	}
 	a.Secret[len(a.Secret)-1] ^= 1
-	if _, e = s.db.Collection("accounts").ReplaceOne(ctx, map[string]string{"_id": a.Email}, a); e != nil {
+	if _, e = s.pool.Exec(ctx, "UPDATE accounts SET secret=$2 WHERE email=$1", a.Email, a.Secret); e != nil {
 		t.Fatal(e)
 	}
 	if _, _, e = s.Credentials(ctx, a.Email); e == nil {
@@ -125,19 +119,14 @@ func TestMongoCredentialIsolationAndTokens(t *testing.T) {
 	}
 }
 func TestLinkIdentity(t *testing.T) {
-	uri := os.Getenv("MAIL_TEST_MONGODB_URI")
-	if uri == "" {
-		t.Skip("set MAIL_TEST_MONGODB_URI for Mongo integration")
-	}
+	uri, schema := pgtest.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	name := "mail_test_" + Random()
-	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", MongoURI: uri, Database: name, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	s, e := New(ctx, Config{BaseURL: "https://mail.example.com", PostgresURI: uri, Schema: schema, EncryptionKey: base64.StdEncoding.EncodeToString(make([]byte, 32))})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer s.Close(ctx)
-	defer func() { _ = s.db.Drop(ctx) }()
 	owner, e := s.LinkIdentity(ctx, "sub-1", " Person@OlegPustovit.com ")
 	if e != nil || owner != "person@olegpustovit.com" {
 		t.Fatal("first sign-in did not link the normalized email", owner, e)
@@ -150,7 +139,7 @@ func TestLinkIdentity(t *testing.T) {
 		t.Fatal("unverified email linked a new subject")
 	}
 	var count int64
-	count, e = s.db.Collection("identities").CountDocuments(ctx, bson.M{"_id": "sub-unbound"})
+	e = s.pool.QueryRow(ctx, "SELECT count(*) FROM identities WHERE subject=$1", "sub-unbound").Scan(&count)
 	if e != nil || count != 0 {
 		t.Fatal("unverified resolution mutated bindings", e)
 	}

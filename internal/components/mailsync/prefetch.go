@@ -4,9 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func (s *Service) queuePrefetch(owner, account string) {
@@ -39,13 +36,7 @@ func (s *Service) prefetchBodies(ctx context.Context, request prefetchRequest) e
 	}
 	defer release()
 	ctx = work
-	rows, err := s.db.Collection("mail_messages").Find(ctx, bson.M{"owner": request.owner, "account": request.account, "email.folder": "INBOX", "body_cached": bson.M{"$ne": true}}, options.Find().SetSort(bson.D{{Key: "email.date", Value: -1}}).SetLimit(50))
-	if err != nil {
-		return err
-	}
-	var messages []Metadata
-	err = rows.All(ctx, &messages)
-	_ = rows.Close(ctx)
+	messages, err := s.loadMessages(ctx, `WHERE owner = $1 AND account = $2 AND folder = 'INBOX' AND NOT body_cached ORDER BY date DESC LIMIT 50`, request.owner, request.account)
 	if err != nil {
 		return err
 	}
@@ -62,7 +53,7 @@ func (s *Service) prefetchBodies(ctx context.Context, request prefetchRequest) e
 			slog.Warn("prefetch message body", "owner", request.owner, "uid", message.ID, "error", err)
 			continue
 		}
-		_, err = s.db.Collection("mail_messages").UpdateOne(ctx, bson.M{"_id": message.Key, "owner": request.owner, "account": request.account, "email.uidvalidity": message.UIDValidity}, bson.M{"$set": bson.M{"body_cached": true, "email.bodyplain": email.BodyPlain, "email.bodyhtml": email.BodyHTML, "email.inlineimages": email.InlineImages}})
+		err = s.cacheBody(ctx, request.owner, request.account, message.Key, email)
 		if err != nil {
 			return err
 		}

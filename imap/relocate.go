@@ -10,9 +10,9 @@ import (
 )
 
 type Location struct {
-	Folder   string `json:"folder" bson:"folder"`
-	ID       string `json:"id" bson:"uid"`
-	Validity uint32 `json:"validity" bson:"validity"`
+	Folder   string `json:"folder"`
+	ID       string `json:"id"`
+	Validity uint32 `json:"validity"`
 }
 
 var ErrLocationChanged = errors.New("message location changed")

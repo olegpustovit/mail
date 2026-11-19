@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/components/mailsync"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmessage"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/components/mailsync"
+	"github.com/olegpustovit/mail/internal/mailmcp"
+	"github.com/olegpustovit/mail/internal/mailmessage"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 // New serves the cookie-authenticated mail API using the same services as MCP.

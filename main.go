@@ -10,10 +10,10 @@ import (
 	"syscall"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/olegpustovit/mcp-icloud-email/config"
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/internal/mailmcp"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
+	"github.com/olegpustovit/mail/config"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/internal/mailmcp"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 // version is set at build time via ldflags.

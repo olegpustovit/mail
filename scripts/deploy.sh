@@ -23,7 +23,8 @@ npm ci
 npm test
 npm run build
 cd ..
-bash scripts/test-owned-mongo.sh go test -race ./...
+[[ -n "${MAIL_TEST_POSTGRES_URI:-}" ]] # tests need a disposable Postgres; they use private schemas
+go test -race ./...
 go vet ./...
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$version" -o "/tmp/mail-server-$version" ./cmd/mail
 scp "/tmp/mail-server-$version" "oracle-vm:/tmp/mail-server-$version"

@@ -14,9 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
-	"github.com/olegpustovit/mcp-icloud-email/smtp"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"github.com/olegpustovit/mail/imap"
+	"github.com/olegpustovit/mail/smtp"
 )
 
 type syncTransport interface {
@@ -860,7 +859,7 @@ func (s *Service) reconcileFolder(m *monitor, wire syncTransport, name string, b
 			known[uid] = mail
 		}
 	} else {
-		existing, err := s.metadata(m.ctx, m.owner, m.account, bson.M{"email.folder": name, "email.uidvalidity": info.UIDValidity}, 0)
+		existing, err := s.metadata(m.ctx, m.owner, m.account, "folder = $3 AND uidvalidity = $4", []any{name, int64(info.UIDValidity)}, "", 0)
 		if err != nil {
 			return err
 		}

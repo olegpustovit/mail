@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olegpustovit/mcp-icloud-email/imap"
+	"github.com/olegpustovit/mail/imap"
 )
 
 type rawHeaderFetcher interface {

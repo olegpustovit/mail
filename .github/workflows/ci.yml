@@ -15,12 +15,14 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     services:
-      mongodb:
-        image: mongo:7
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
         ports:
-          - 27018:27017
+          - 55432:5432
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -62,7 +64,7 @@ jobs:
 
       - name: Test with race detector
         env:
-          MAIL_TEST_MONGODB_URI: mongodb://127.0.0.1:27018
+          MAIL_TEST_POSTGRES_URI: postgres://postgres:postgres@127.0.0.1:55432/postgres
         run: go test -race -v ./...
 
   lint:

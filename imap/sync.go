@@ -101,15 +101,15 @@ const syncFetchTimeout = 60 * time.Second
 var ErrSyncAuthentication = errors.New("iCloud app-specific password was rejected")
 
 type FolderInfo struct {
-	Name          string   `json:"name" bson:"name"`
-	Role          string   `json:"role" bson:"role"`
-	Delimiter     string   `json:"delimiter" bson:"delimiter"`
-	Attributes    []string `json:"attributes" bson:"attributes"`
-	UIDValidity   uint32   `json:"uidValidity" bson:"uid_validity"`
-	UIDNext       uint32   `json:"uidNext" bson:"uid_next"`
-	HighestModSeq uint64   `json:"highestModSeq" bson:"highest_mod_seq"`
-	Total         uint32   `json:"total" bson:"total"`
-	Unread        uint32   `json:"unread" bson:"unread"`
+	Name          string   `json:"name"`
+	Role          string   `json:"role"`
+	Delimiter     string   `json:"delimiter"`
+	Attributes    []string `json:"attributes"`
+	UIDValidity   uint32   `json:"uidValidity"`
+	UIDNext       uint32   `json:"uidNext"`
+	HighestModSeq uint64   `json:"highestModSeq"`
+	Total         uint32   `json:"total"`
+	Unread        uint32   `json:"unread"`
 }
 type StorageQuota struct {
 	Used  int64 `json:"used"`
