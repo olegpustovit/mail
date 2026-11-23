@@ -1,11 +1,16 @@
 package imap
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
 )
 
 func TestRelatedImagePartsRetainCIDBytes(t *testing.T) {
@@ -81,10 +86,40 @@ func TestReadBoundedBody(t *testing.T) {
 	}
 }
 
-func TestBodyReadUsesPeekAndByteLimit(t *testing.T) {
-	section := &imap.BodySectionName{Peek: true, Partial: []int{0, maxMessageSize + 1}}
-	if got, want := string(section.FetchItem()), "BODY.PEEK[]<0.20971521>"; got != want {
-		t.Fatalf("fetch item = %q, want %q", got, want)
+func TestGetEmailDoesNotRequestEnvelope(t *testing.T) {
+	conn, server := net.Pipe()
+	defer conn.Close()
+	defer server.Close()
+	_ = server.SetDeadline(time.Now().Add(5 * time.Second))
+	const raw = "From: Sender <sender@example.com>\r\nTo: recipient@example.com\r\nSubject: Path C:\\example\r\nMessage-ID: <test@example.com>\r\n\r\nMessage body"
+	go func() {
+		defer server.Close()
+		reader := bufio.NewReader(server)
+		_, _ = io.WriteString(server, "* PREAUTH [CAPABILITY IMAP4rev1] ready\r\n")
+		selectCommand, _ := reader.ReadString('\n')
+		selectTag, _, _ := strings.Cut(selectCommand, " ")
+		_, _ = fmt.Fprintf(server, "* 1 EXISTS\r\n* OK [UIDVALIDITY 42] valid\r\n%s OK selected\r\n", selectTag)
+		fetchCommand, _ := reader.ReadString('\n')
+		fetchTag, fetchArgs, _ := strings.Cut(fetchCommand, " ")
+		if fetchArgs != "UID FETCH 7 (FLAGS UID BODY.PEEK[]<0.20971521>)\r\n" {
+			t.Errorf("unexpected FETCH command: %q", fetchArgs)
+			return
+		}
+		_, _ = fmt.Fprintf(server, "* 1 FETCH (UID 7 FLAGS (\\Seen) BODY[]<0> {%d}\r\n%s)\r\n%s OK fetched\r\n", len(raw), raw, fetchTag)
+	}()
+
+	wire, err := client.New(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	email, err := (&Client{client: wire}).GetEmail(t.Context(), "INBOX", "7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email.ID != "7" || email.UIDValidity != 42 || email.Unread || email.Subject != "Path C:\\example" ||
+		email.MessageID != "test@example.com" || email.From != "Sender <sender@example.com>" ||
+		len(email.To) != 1 || email.To[0] != "recipient@example.com" || email.BodyPlain != "Message body" {
+		t.Fatalf("unexpected message: %+v", email)
 	}
 }
 

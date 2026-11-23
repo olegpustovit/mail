@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	netmail "net/mail"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -424,32 +425,27 @@ func (c *Client) getEmail(folder, emailID string) (*Email, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
 
-	// Fetch full message
+	// Read headers from the raw message because iCloud can return malformed ENVELOPE strings.
 	messages := make(chan *imap.Message, 1)
 	done := make(chan error, 1)
 	section := &imap.BodySectionName{Peek: true, Partial: []int{0, maxMessageSize + 1}}
 	go func() {
-		done <- c.client.UidFetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchUid, section.FetchItem()}, messages)
+		done <- c.client.UidFetch(seqSet, []imap.FetchItem{imap.FetchFlags, imap.FetchUid, section.FetchItem()}, messages)
 	}()
 
 	msg := <-messages
-	if msg == nil {
-		if err := <-done; err != nil {
-			return nil, fmt.Errorf("failed to fetch message: %w", err)
-		}
-		return nil, fmt.Errorf("email not found")
-	}
-
-	email := c.parseMessageData(msg)
-
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("failed to fetch message: %w", err)
 	}
-
-	if email == nil {
-		return nil, fmt.Errorf("failed to parse email")
+	if msg == nil {
+		return nil, fmt.Errorf("email not found")
 	}
-	email.UIDValidity = mailbox.UidValidity
+	email := &Email{
+		ID:          strconv.FormatUint(uint64(msg.Uid), 10),
+		UIDValidity: mailbox.UidValidity,
+		Unread:      !slices.Contains(msg.Flags, imap.SeenFlag),
+		FlagColor:   flagColor(msg.Flags),
+	}
 	var literal imap.Literal
 	for _, body := range msg.Body {
 		literal = body
@@ -718,28 +714,46 @@ func (c *Client) parseEmailBody(email *Email, rawMessage io.Reader) error {
 		return fmt.Errorf("failed to create message reader: %w", err)
 	}
 
+	email.Subject, _ = mr.Header.Subject()
+	email.Date, _ = mr.Header.Date()
+	email.MessageID, _ = mr.Header.MessageID()
+	email.References, _ = mr.Header.MsgIDList("In-Reply-To")
+	from, _ := mr.Header.AddressList("From")
+	if len(from) > 0 {
+		email.From = formatMIMEAddress(from[0])
+	}
+	email.To = mimeAddresses(&mr.Header, "To")
+	email.CC = mimeAddresses(&mr.Header, "Cc")
+	email.BCC = mimeAddresses(&mr.Header, "Bcc")
+
 	if err := c.processMessagePart(email, mr); err != nil {
 		return err
 	}
 
-	// Create snippet from plain text body
+	email.Snippet = email.Subject
 	if email.BodyPlain != "" {
-		snippet := strings.TrimSpace(email.BodyPlain)
-		if len(snippet) > 200 {
-			email.Snippet = snippet[:197] + "..."
-		} else {
-			email.Snippet = snippet
-		}
-	} else if email.BodyHTML != "" {
-		// Use subject as snippet if no plain text
-		snippet := email.Subject
-		if len(snippet) > 200 {
-			email.Snippet = snippet[:197] + "..."
-		} else {
-			email.Snippet = snippet
-		}
+		email.Snippet = strings.TrimSpace(email.BodyPlain)
+	}
+	if len(email.Snippet) > 200 {
+		email.Snippet = email.Snippet[:197] + "..."
 	}
 	return nil
+}
+
+func mimeAddresses(header *message.Header, field string) []string {
+	addresses, _ := header.AddressList(field)
+	formatted := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		formatted = append(formatted, formatMIMEAddress(address))
+	}
+	return formatted
+}
+
+func formatMIMEAddress(address *message.Address) string {
+	if address.Name == "" {
+		return address.Address
+	}
+	return address.Name + " <" + address.Address + ">"
 }
 
 func readBoundedBody(body io.Reader) ([]byte, error) {
