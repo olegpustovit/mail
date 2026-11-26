@@ -3,8 +3,9 @@
 set -Eeuo pipefail
 
 cd "$(dirname "$0")/.."
-[[ "$(git branch --show-current)" == main ]]
-git merge-base --is-ancestor HEAD origin/main
+[[ "$(git branch --show-current)" == dev ]]
+git fetch -q origin dev
+git merge-base --is-ancestor HEAD origin/dev # push first: production only runs pushed commits
 [[ -z "$(git status --porcelain --untracked-files=no)" ]]
 
 if [[ -f .envrc ]]; then

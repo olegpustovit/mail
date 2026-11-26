@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/commands"
 )
 
 type Location struct {
@@ -50,12 +52,13 @@ func (c *Client) relocate(from Location, to, marker string) (Location, error) {
 	if from.Validity == 0 || box.UidValidity != from.Validity {
 		return Location{}, ErrLocationChanged
 	}
-	if !supportsMoveMarker(box.PermanentFlags, marker) {
-		return Location{}, ErrMarkerUnsupported
-	}
 	uid, err := parseUID(from.ID)
 	if err != nil {
 		return Location{}, err
+	}
+	if !supportsMoveMarker(box.PermanentFlags, marker) {
+		// Some mailboxes (iCloud's Junk) cannot hold keywords; anchor recovery on the destination instead.
+		return c.relocateUnmarked(from, to, marker, uid)
 	}
 	supported, err := c.client.Support("MOVE")
 	if err != nil {
@@ -89,7 +92,8 @@ func (c *Client) relocate(from Location, to, marker string) (Location, error) {
 		return Location{}, err
 	}
 	if len(uids) != 1 {
-		return Location{}, ErrMarkerUnsupported
+		// The server accepted the STORE but did not keep the keyword.
+		return c.relocateUnmarked(from, to, marker, uid)
 	}
 	if from.Folder == to {
 		return from, nil
@@ -115,7 +119,83 @@ func (c *Client) relocate(from Location, to, marker string) (Location, error) {
 	return found, err
 }
 
-// Remove the source only after its marked destination is confirmed, including on retry after COPY.
+// relocateUnmarked moves a message out of a mailbox that cannot retain the recovery keyword.
+// COPYUID identifies the new copy, which receives the marker; the source is expunged only afterwards.
+// A response lost between COPY and marking can leave one extra copy in the destination, never a lost message.
+func (c *Client) relocateUnmarked(from Location, to, marker string, uid uint32) (Location, error) {
+	uidPlus, err := c.client.Support("UIDPLUS")
+	if err != nil {
+		return Location{}, err
+	}
+	if !uidPlus {
+		return Location{}, fmt.Errorf("%w: source mailbox keeps no keywords and server lacks UIDPLUS", ErrMarkerUnsupported)
+	}
+	set := new(imap.SeqSet)
+	set.AddNum(uid)
+	exists, err := c.uidExists(set, uid)
+	if err != nil {
+		return Location{}, err
+	}
+	if !exists {
+		return Location{}, ErrLocationChanged
+	}
+	if from.Folder == to {
+		return from, nil
+	}
+	status, err := c.client.Execute(&commands.Uid{Cmd: &commands.Copy{SeqSet: set, Mailbox: to}}, nil)
+	if err == nil {
+		err = status.Err()
+	}
+	if err != nil {
+		return Location{}, fmt.Errorf("relocate message (destination will be checked before retry): %w", err)
+	}
+	validity, destUID, ok := copiedUID(status)
+	if !ok {
+		return Location{}, errors.New("moved message destination could not be confirmed: server sent no COPYUID")
+	}
+	box, err := c.client.Select(to, false)
+	if err != nil {
+		return Location{}, err
+	}
+	if box.UidValidity != validity {
+		return Location{}, ErrLocationChanged
+	}
+	destSet := new(imap.SeqSet)
+	destSet.AddNum(destUID)
+	// Best effort: the marker only lets a retry recognise this copy if the source expunge fails.
+	_ = c.client.UidStore(destSet, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{marker}, nil)
+	if err = c.finishCopiedMove(from, marker); err != nil {
+		return Location{}, err
+	}
+	return Location{Folder: to, ID: fmt.Sprint(destUID), Validity: validity}, nil
+}
+
+// copiedUID reads the single destination UID from a COPYUID response code (RFC 4315).
+func copiedUID(status *imap.StatusResp) (validity, uid uint32, ok bool) {
+	if status == nil || status.Code != "COPYUID" || len(status.Arguments) < 3 {
+		return 0, 0, false
+	}
+	v, err := strconv.ParseUint(fmt.Sprint(status.Arguments[0]), 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	u, err := strconv.ParseUint(fmt.Sprint(status.Arguments[2]), 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	return uint32(v), uint32(u), true
+}
+
+func (c *Client) uidExists(set *imap.SeqSet, uid uint32) (bool, error) {
+	criteria := imap.NewSearchCriteria()
+	criteria.Uid = set
+	uids, err := c.client.UidSearch(criteria)
+	return len(uids) == 1 && uids[0] == uid, err
+}
+
+// Remove the source only after its destination copy is confirmed, including on retry after COPY.
+// The unique marker, or COPYUID for keywordless mailboxes, proves the destination holds this exact message,
+// and a UID is never reused within one UIDVALIDITY, so the source UID is the same message.
 func (c *Client) finishCopiedMove(from Location, marker string) error {
 	box, err := c.client.Select(from.Folder, false)
 	if err != nil {
@@ -130,8 +210,8 @@ func (c *Client) finishCopiedMove(from Location, marker string) error {
 	}
 	set := new(imap.SeqSet)
 	set.AddNum(uid)
-	uids, err := c.markerUIDs(set, marker)
-	if err != nil || len(uids) == 0 {
+	exists, err := c.uidExists(set, uid)
+	if err != nil || !exists {
 		return err
 	}
 	uidPlus, err := c.client.Support("UIDPLUS")
